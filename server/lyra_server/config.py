@@ -55,7 +55,11 @@ def synced_folder_reason(path):
   probe = real
   while True:
     for marker in SYNC_MARKERS:
-      if (probe / marker).exists():
+      m = probe / marker
+      if m.exists():
+        # ~/.dropbox is the Dropbox app config dir in $HOME, not a synced folder.
+        if marker == '.dropbox' and probe == home and m.is_dir():
+          continue
         return f'sync marker {marker} found in {probe}'
     if probe.parent == probe:
       break

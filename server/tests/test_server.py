@@ -158,6 +158,18 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
           config.validate(config.load(env={'LYRA_DATA_DIR': p}))
 
+  def test_allows_local_dir_when_home_has_dropbox_app_dir(self):
+    fake_home = Path(tmpdir())
+    (fake_home / '.dropbox').mkdir()
+    local_data = fake_home / 'Library' / 'Application Support' / 'lyra-server'
+    orig_home = Path.home
+    try:
+      Path.home = classmethod(lambda cls: fake_home)
+      s = config.validate(config.load(env={'LYRA_DATA_DIR': str(local_data)}))
+      self.assertEqual(s.data_path, local_data)
+    finally:
+      Path.home = orig_home
+
   def test_refuses_plaintext_non_loopback(self):
     with self.assertRaises(config.ConfigError):
       config.validate(config.load(env={'LYRA_DATA_DIR': tmpdir(), 'LYRA_BIND': '0.0.0.0',
