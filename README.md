@@ -33,7 +33,7 @@ Then open `http://127.0.0.1:8740/` in a browser and sign in.
 
 ### 2. Connect a Claude Code workspace skill
 
-Export the `lyra-link` skill into any target workspace:
+Export the `lyra-link` skill into any target workspace. Links in the skill's Markdown that point elsewhere in this repository are rewritten to GitHub URLs (`--ref` picks the branch or tag, default `main`), so they keep working outside the repository:
 
 ```bash
 python3 -B scripts/export_claude_skill.py /path/to/workspace
@@ -46,6 +46,7 @@ Inside a running Claude Code session in that workspace, invoke `/lyra-link` and 
 ```bash
 python3 -B -m unittest discover -s server/tests -p "test_*.py" -v
 python3 -B -m unittest discover -s connectors/lyra-link/scripts -p "test_*.py" -v
+python3 -B -m unittest discover -s scripts -p "test_*.py" -v
 ```
 
 ## License

@@ -13,7 +13,10 @@ dependencies = []
 lyra-server = "lyra_server.cli:main"
 
 [tool.setuptools]
-packages = ["lyra_server"]
+# The board's static files are a data package; listing it keeps them in the
+# wheel on setuptools versions that drop unlisted importable directories.
+packages = ["lyra_server", "lyra_server.static"]
 
 [tool.setuptools.package-data]
-lyra_server = ["schema.sql", "static/*"]
+lyra_server = ["schema.sql"]
+"lyra_server.static" = ["*.html", "*.js", "*.css"]

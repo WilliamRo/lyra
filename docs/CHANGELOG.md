@@ -1,5 +1,10 @@
 # Lyra Changelog
 
+## Unreleased
+
+- **Skill export:** `scripts/export_claude_skill.py` rewrites Markdown links that leave `connectors/lyra-link/` (for example `../../docs/DESIGN.md`) to GitHub URLs, so the exported copy has no broken links; `--ref` selects the branch or tag. Covered by new tests in `scripts/` (`python3 -B -m unittest discover -s scripts -p "test_*.py"`).
+- **Packaging:** `lyra_server.static` is declared as a package, which silences the setuptools warning that unlisted data directories may be dropped from future wheels and keeps the board files installed.
+
 ## 1. Version 1.0.0 (2026-11-27)
 
 - **Server:** portable stdlib `lyra-server` package with configurable bind, port, public URL, data directory and built-in TLS; refuses synced data directories and plaintext non-loopback binds; `serve`, `check-config`, `init-admin`, `reset-password`, `backup` and `restore`.
