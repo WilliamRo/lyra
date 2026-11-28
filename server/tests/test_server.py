@@ -1106,13 +1106,19 @@ class SseAndBackupTests(ServerCase):
 
 class SenateAndConsulTests(ServerCase):
 
-  def test_senate_tab_placed_right_of_admin(self):
+  def test_admin_and_senate_share_one_tab(self):
+    # UI v2 merges Admin and Senate into one "Admin & Senate" tab (UI_DESIGN_V2.md section 9).
     with urllib.request.urlopen(f'{self.base}/') as resp:
       html = resp.read().decode('utf-8')
-    admin_pos = html.find('data-tab="admin"')
-    senate_pos = html.find('data-tab="senate"')
-    self.assertGreater(admin_pos, 0)
-    self.assertGreater(senate_pos, admin_pos)
+    self.assertIn('data-tab="admin-senate"', html)
+    for old in ('data-tab="admin"', 'data-tab="senate"', 'data-tab="usage"'):
+      self.assertNotIn(old, html)
+    pane = html.find('data-pane="admin-senate"')
+    senate = html.find('id="senate-form"')
+    invites = html.find('id="invite-form"')
+    self.assertGreater(pane, 0)
+    self.assertGreater(senate, pane)
+    self.assertGreater(invites, pane)
     self.assertIn('Appoint Consul', html)
     self.assertIn('Dismiss Consul', html)
 

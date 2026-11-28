@@ -265,6 +265,20 @@
     assert.eq(bad.text, 'X');
   });
 
+  test('avatar: server formats (preset string, icon and colour, emoji, short text)', function () {
+    var preset = A.spec({ handle: 'g', avatar: 'gem' });
+    assert.eq(preset.text, '\u25c6');
+    assert.eq(preset.custom, true);
+    var named = A.spec({ handle: 'g', avatar: { icon: 'moon', color: 'navy' } });
+    assert.eq(named.bg, '#1e2f6b');
+    assert.eq(named.fg, '#ffffff');
+    assert.eq(A.spec({ handle: 'g', avatar: { color: '#0a0' } }).bg, '#00aa00', '#rgb expands');
+    assert.eq(A.spec({ handle: 'g', avatar: { icon: 'ab' } }).text, 'AB');
+    assert.eq(A.spec({ handle: 'g', avatar: { icon: '\ud83e\udd16' } }).text, '\ud83e\udd16');
+    assert.eq(A.spec({ handle: 'g', avatar: { icon: 'toolongtext' } }).text, 'G', 'unknown long text falls back');
+    assert.eq(A.spec({ handle: 'g', avatar: { color: 'url(x)' } }).custom, false);
+  });
+
   // ---------------------------------------------------------------------------
   // lifecycle.js
   // ---------------------------------------------------------------------------
@@ -297,5 +311,22 @@
     var c = L.cleanProgress({ phase: 'working', summary: 's', bullets: [{ text: 'x', status: 'weird' }, { text: '' }, 3] });
     assert.deep(c.bullets, [{ text: 'x', status: 'pending' }]);
     assert.eq(L.cleanProgress({ phase: 'hacking' }), null);
+  });
+
+  test('lifecycle: server progress (bullet state, stale flag)', function () {
+    var p = L.cleanProgress({ phase: 'working', summary: 'Auditing', updated_at: 1000, stale: true,
+                              bullets: [{ text: 'a', state: 'done' }, { text: 'b', state: 'active' }, { text: 'c', state: 'pending' }] });
+    assert.deep(p.bullets.map(function (b) { return b.status; }), ['done', 'active', 'pending']);
+    assert.eq(p.stale, true);
+    assert.eq(L.cleanProgress({ phase: 'working', stale: 'yes' }).stale, false, 'only a real true counts');
+    var m = { id: 10, conversation_id: 1, recipient: { id: 2 }, state: 'delivered', delivered_at: 900,
+              progress: { phase: 'working', summary: 'Auditing', updated_at: 1000, stale: true } };
+    var info = L.phase(m, { now: 1000 + 300 });
+    assert.eq(info.phase, 'working');
+    assert.eq(info.stale, true);
+    assert.eq(info.label, 'No update for 5 min: Auditing');
+    var fresh = L.phase(Object.assign({}, m, { progress: { phase: 'thinking', updated_at: 1290 } }), { now: 1300 });
+    assert.ok(!fresh.stale, 'fresh progress is not stale');
+    assert.eq(fresh.label, 'Thinking\u2026');
   });
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -3,8 +3,10 @@
 //   LyraAvatar.spec(principal)                -> { bg, fg, text, custom }
 //   LyraAvatar.el(principal, size, options)   -> <span class="avatar avatar-md"> (DOM)
 //   LyraAvatar.contrast('#ffffff', '#3730a3') -> WCAG contrast ratio
-// principal.avatar may be { bg: '#rrggbb', fg: '#rrggbb', icon: 'initials' | token }.
-// Colours are validated as hex and applied through the CSSOM, never as markup.
+// principal.avatar follows the server (schema v4): a preset string (an icon token such as
+// "star", a short emoji, or initials) or an object { icon, color } where color is a hex value
+// or a palette name. The older { bg, fg } form is also accepted. Colours are validated and
+// applied through the CSSOM, never as markup.
 (function (root) {
   'use strict';
 
@@ -25,6 +27,9 @@
                 gem: '◆', orbit: '◎', leaf: '❦', wave: '∿', key: '⚷' };
   var SIZES = { xs: 'avatar-xs', sm: 'avatar-sm', md: 'avatar-md', lg: 'avatar-lg' };
   var HEX_RE = /^#[0-9a-fA-F]{6}$/;
+  var NAMED = { red: '#b4233c', orange: '#a23d05', amber: '#8a4b08', yellow: '#ffd60a', gold: '#c98a12',
+                green: '#08704f', blue: '#1d4fd8', navy: '#1e2f6b', purple: '#7b2cbf', pink: '#be185d',
+                gray: '#475569', grey: '#475569', black: '#0f1626', white: '#ffffff' };
   var INK = '#0f1626';
 
   function fnv1a(str) {
@@ -71,24 +76,45 @@
     return PALETTE[fnv1a(key) % PALETTE.length];
   }
 
+  // '#abc', '#abcd', '#aabbcc', '#aabbccdd' or a palette / basic colour name -> '#aabbcc'.
+  function color(value) {
+    var v = String(value || '').trim().toLowerCase();
+    if (/^#[0-9a-f]{3,4}$/.test(v)) return '#' + v[1] + v[1] + v[2] + v[2] + v[3] + v[3];
+    if (/^#[0-9a-f]{6}([0-9a-f]{2})?$/.test(v)) return v.slice(0, 7);
+    for (var i = 0; i < PALETTE.length; i++) if (PALETTE[i].name === v) return PALETTE[i].bg;
+    return Object.prototype.hasOwnProperty.call(NAMED, v) ? NAMED[v] : null;
+  }
+
+  function glyph(icon) {
+    var t = String(icon || '').trim();
+    if (!t || t === 'initials') return null;
+    if (Object.prototype.hasOwnProperty.call(ICONS, t.toLowerCase())) return ICONS[t.toLowerCase()];
+    var chars = Array.from(t);
+    if (chars.length <= 2 && !/[<>=$]/.test(t)) return /^[a-z]+$/i.test(t) ? t.toUpperCase() : t;
+    if (/\p{Extended_Pictographic}/u.test(t) && t.length <= 16) return t;   // emoji with joiners
+    return null;
+  }
+
   function spec(principal) {
     var p = principal || {};
     var base = pick(p);
     var bg = base.bg;
     var fg = '#ffffff';
     var custom = false;
-    var a = p.avatar && typeof p.avatar === 'object' ? p.avatar : null;
-    if (a && HEX_RE.test(a.bg || '')) {
-      bg = a.bg.toLowerCase();
+    var a = p.avatar;
+    if (typeof a === 'string') a = { icon: a };
+    if (!a || typeof a !== 'object') a = null;
+    var c = a ? color(a.color || a.bg) : null;
+    if (c) {
+      bg = c;
       custom = true;
       if (HEX_RE.test(a.fg || '') && contrast(a.fg, bg) >= 4.5) fg = a.fg.toLowerCase();
       else fg = contrast('#ffffff', bg) >= contrast(INK, bg) ? '#ffffff' : INK;
     }
     var text = initials(p.display_name, p.handle);
-    if (a && a.icon && a.icon !== 'initials' && Object.prototype.hasOwnProperty.call(ICONS, a.icon)) {
-      text = ICONS[a.icon];
-    }
-    return { bg: bg, fg: fg, text: text, custom: custom, hue: custom ? null : base.name };
+    var g = a ? glyph(a.icon) : null;
+    if (g) { text = g; custom = true; }
+    return { bg: bg, fg: fg, text: text, custom: custom, hue: c ? null : base.name };
   }
 
   function el(principal, size, options) {
@@ -138,6 +164,7 @@
     stack: stack,
     initials: initials,
     contrast: contrast,
+    color: color,
     hash: fnv1a,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

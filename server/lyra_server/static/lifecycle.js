@@ -24,9 +24,11 @@
       summary: typeof p.summary === 'string' ? p.summary.slice(0, 200) : '',
       bullets: bullets.filter(function (b) { return b && typeof b.text === 'string' && b.text.trim(); })
         .map(function (b) {
-          return { text: b.text.slice(0, 160), status: BULLET_STATES.indexOf(b.status) !== -1 ? b.status : 'pending' };
+          var st = b.status || b.state;                    // the server sends `state`
+          return { text: b.text.slice(0, 200), status: BULLET_STATES.indexOf(st) !== -1 ? st : 'pending' };
         }),
       updated_at: typeof p.updated_at === 'number' ? p.updated_at : null,
+      stale: p.stale === true,
     };
   }
 
@@ -70,14 +72,19 @@
                                   label: 'Waiting in queue' + (q && q > 1 ? ' (#' + q + ')' : '') });
     }
     if (m.state === 'delivered') {
-      if (prog && prog.phase === 'working') {
-        return Object.assign(out, { phase: 'working', step: 3, label: prog.summary || 'Working…' });
-      }
-      if (prog && prog.phase === 'thinking') {
-        return Object.assign(out, { phase: 'thinking', step: 3, label: prog.summary || 'Thinking…' });
+      var now = typeof c.now === 'number' ? c.now : Date.now() / 1000;
+      if (prog && (prog.phase === 'working' || prog.phase === 'thinking')) {
+        var working = prog.phase === 'working';
+        if (prog.stale) {
+          // Server flag: no progress update for longer than progress_stale_sec.
+          var quiet = typeof prog.updated_at === 'number' ? ' for ' + minutes(now - prog.updated_at) : '';
+          return Object.assign(out, { phase: prog.phase, step: 3, stale: true,
+                                      label: 'No update' + quiet + (prog.summary ? ': ' + prog.summary : '') });
+        }
+        return Object.assign(out, { phase: prog.phase, step: 3,
+                                    label: prog.summary || (working ? 'Working…' : 'Thinking…') });
       }
       var since = (prog && prog.updated_at) || m.delivered_at;
-      var now = typeof c.now === 'number' ? c.now : Date.now() / 1000;
       var limit = typeof c.staleAfterSec === 'number' ? c.staleAfterSec : STALE_AFTER;
       if (typeof since === 'number' && now - since >= limit) {
         return Object.assign(out, { phase: 'delivered', step: 2, stale: true,
@@ -141,7 +148,7 @@
     var status = node(doc, 'div', 'lc-status');
     status.setAttribute('role', 'status');
     status.setAttribute('aria-live', 'polite');
-    if (info.phase === 'thinking' || info.phase === 'sending') {
+    if ((info.phase === 'thinking' && !info.stale) || info.phase === 'sending') {
       var dots = node(doc, 'span', 'thinking-dots');
       dots.setAttribute('aria-hidden', 'true');
       for (var d = 0; d < 3; d++) dots.appendChild(doc.createElement('span'));

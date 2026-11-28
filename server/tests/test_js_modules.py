@@ -1,10 +1,12 @@
 # =============================================================================
 # test_js_modules.py: Tests for the zero-dependency board modules in static/.
-#   - static hygiene: no HTML-string sinks in the new modules
+#   - static hygiene: no HTML-string sinks in the modules or app.js, and the
+#     live web.CSP allows only what KaTeX needs (inline style attributes)
 #   - engine tests (tests/js/test_engine.js) under JavaScriptCore `jsc` or Node
-#   - browser tests (tests/js/test_dom.js) in headless Chrome when
-#     LYRA_BROWSER_TESTS=1, served with the real Lyra CSP header and with the
-#     proposed v2 CSP that adds style-src-attr for KaTeX
+#   - browser tests in headless Chrome when LYRA_BROWSER_TESTS=1, served with
+#     the live Lyra CSP header: the DOM suite (tests/js/test_dom.js) and a CSP
+#     probe proving KaTeX renders while unsafe scripts and styles are blocked
+#   (the wired board end to end lives in test_board_e2e.py)
 # =============================================================================
 
 import html
@@ -25,6 +27,7 @@ SERVER = Path(__file__).resolve().parents[1]
 STATIC = SERVER / 'lyra_server' / 'static'
 JS = SERVER / 'tests' / 'js'
 MODULES = ['markdown.js', 'imgpop.js', 'store.js', 'avatar.js', 'lifecycle.js']
+SCANNED = MODULES + ['app.js']
 JSC = '/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc'
 CHROMES = [
   os.environ.get('LYRA_CHROME', ''),
@@ -35,9 +38,16 @@ CHROMES = [
 RESULT_RE = re.compile(r'<pre id="lyra-result">(.*?)</pre>', re.S)
 
 sys.path.insert(0, str(SERVER))
-from lyra_server.web import CSP  # noqa: E402  (read-only: the CSP the server sends today)
+from lyra_server.web import CSP  # noqa: E402  (read-only: the CSP the server sends)
 
-CSP_V2 = CSP + "; style-src-attr 'unsafe-inline'"
+
+def csp_directives(policy=CSP):
+  out = {}
+  for part in policy.split(';'):
+    bits = part.split()
+    if bits:
+      out[bits[0]] = bits[1:]
+  return out
 
 
 def engine_command():
@@ -72,16 +82,30 @@ class StaticHygieneTests(unittest.TestCase):
            "setAttribute('style'", 'setAttribute("style"')
 
   def test_modules_never_parse_html_strings(self):
-    for name in MODULES:
+    for name in SCANNED:
       src = (STATIC / name).read_text(encoding='utf-8')
       for sink in self.SINKS:
         with self.subTest(module=name, sink=sink):
           self.assertNotIn(sink, src)
 
   def test_modules_never_set_event_handler_attributes(self):
-    for name in MODULES:
+    for name in SCANNED:
       src = (STATIC / name).read_text(encoding='utf-8')
       self.assertIsNone(re.search(r"setAttribute\(\s*['\"]on", src), name)
+
+  def test_live_csp_allows_katex_style_attributes_only(self):
+    d = csp_directives()
+    self.assertEqual(d.get('default-src'), ["'none'"])
+    self.assertEqual(d.get('script-src'), ["'self'"])            # no inline, eval or remote scripts
+    self.assertEqual(d.get('style-src'), ["'self'"])
+    self.assertEqual(d.get('style-src-elem'), ["'self'"])        # no <style> elements or remote sheets
+    self.assertEqual(d.get('style-src-attr'), ["'unsafe-inline'"])  # KaTeX sizing attributes only
+    self.assertEqual(d.get('font-src'), ["'self'"])              # vendored KaTeX fonts
+    self.assertNotIn('script-src-attr', d)                        # falls back to script-src 'self'
+    for name, values in d.items():
+      if name != 'style-src-attr':
+        self.assertNotIn("'unsafe-inline'", values, name)
+      self.assertNotIn("'unsafe-eval'", values, name)
 
   def test_vendored_katex_is_present_and_licensed(self):
     k = STATIC / 'vendor' / 'katex'
@@ -110,9 +134,9 @@ class _StaticHandler(SimpleHTTPRequestHandler):
   def end_headers(self):
     u = urlsplit(self.path)
     if u.path.endswith('.html'):
-      mode = parse_qs(u.query).get('csp', ['v2'])[0]
+      mode = parse_qs(u.query).get('csp', ['live'])[0]
       if mode != 'off':                       # 'off' only for phone.html visual QA framing
-        self.send_header('Content-Security-Policy', CSP if mode == 'current' else CSP_V2)
+        self.send_header('Content-Security-Policy', CSP)
     self.send_header('X-Content-Type-Options', 'nosniff')
     self.send_header('Cache-Control', 'no-store')
     super().end_headers()
@@ -139,10 +163,10 @@ class BrowserTests(unittest.TestCase):
     cls.httpd.server_close()
     shutil.rmtree(cls.profile, ignore_errors=True)
 
-  def run_page(self, csp, size='1280,800'):
+  def run_page(self, page='browser.html', size='1280,800'):
     cmd = [find_chrome(), '--headless=new', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
            '--disable-extensions', f'--user-data-dir={self.profile}', f'--window-size={size}',
-           '--virtual-time-budget=15000', '--dump-dom', f'{self.base}/tests/js/browser.html?csp={csp}']
+           '--virtual-time-budget=15000', '--dump-dom', f'{self.base}/tests/js/{page}?csp=live']
     if sys.platform.startswith('linux'):
       cmd.insert(1, '--no-sandbox')
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -150,22 +174,29 @@ class BrowserTests(unittest.TestCase):
     self.assertIsNotNone(m, 'browser produced no result:\n' + out.stdout[-1500:] + out.stderr[-1500:])
     return json.loads(html.unescape(m.group(1)))
 
-  def test_browser_suite_under_v2_csp(self):
-    r = self.run_page('v2')
+  def test_browser_suite_under_live_csp(self):
+    r = self.run_page()
     self.assertEqual(failures(r), [])
     self.assertGreater(r['total'], 30)
-    self.assertEqual(r['csp'], [], 'no CSP violations with style-src-attr for KaTeX')
+    self.assertEqual(r['csp'], [], 'KaTeX and the modules must render without CSP violations')
 
-  def test_current_csp_blocks_katex_inline_styles(self):
-    # Documents the server prerequisite in UI_DESIGN_V2.md: today's CSP rejects
-    # KaTeX's style attributes, so the v2 header must add style-src-attr.
-    r = self.run_page('current')
-    directives = {v['directive'] for v in r['csp']}
-    self.assertTrue(any(d.startswith('style-src') for d in directives), r['csp'])
-    self.assertFalse(any(d.startswith('script-src') for d in directives), r['csp'])
+  def test_live_csp_allows_katex_and_blocks_unsafe_scripts_and_styles(self):
+    r = self.run_page('csp_probe.html')
+    f = r['flags']
+    # i. Allowed: KaTeX output and inline style attributes (style-src-attr 'unsafe-inline').
+    self.assertTrue(f['katexRendered'], r)
+    self.assertTrue(f['katexStyleApplied'], r)
+    self.assertTrue(f['styleAttrApplied'], r)
+    # ii. Blocked: inline <script>, inline handlers, eval, data: scripts and <style> elements.
+    for flag in ('inlineScript', 'handler', 'evalRan', 'dataScript', 'styleElemApplied'):
+      self.assertFalse(f[flag], flag)
+    directives = [v['directive'] for v in r['csp']]
+    self.assertFalse(any(d.startswith('style-src-attr') for d in directives), r['csp'])
+    self.assertTrue(any(d.startswith('style-src') for d in directives), r['csp'])        # the <style> element
+    self.assertGreaterEqual(sum(d.startswith('script-src') for d in directives), 3, r['csp'])
 
   def test_mobile_viewport(self):
-    r = self.run_page('v2', size='390,844')
+    r = self.run_page(size='390,844')
     self.assertEqual(failures(r), [])
 
 

@@ -15,7 +15,8 @@
   var TABS = ['chats', 'projects', 'admin-senate', 'agents'];
   var LEGACY_TABS = { board: 'chats', usage: 'chats', admin: 'admin-senate', senate: 'admin-senate' };
   var GROUPS = ['machine', 'provider'];
-  var PROJECT_FILTERS = ['all', 'active', 'paused', 'archived'];
+  var PROJECT_FILTERS = ['all', 'active', 'paused', 'completed', 'archived'];
+  var TASK_FILTERS = ['all', 'open', 'in_progress', 'in_review', 'blocked', 'done'];
   var MAX_DRAFT = 20000;
   var MAX_IDS = 200;
 
@@ -92,7 +93,8 @@
     return {
       activeTab: 'chats', selectedConvId: null, pendingAgentId: null, agentGroupMode: 'machine',
       expandedAgentIds: [], expandedMachineIds: [], expandedProviderIds: [], expandedPoolIds: [],
-      activeProjectId: null, projectStatusFilter: 'all', mobileChatView: 'list',
+      activeProjectId: null, projectStatusFilter: 'all', taskStatusFilter: 'all', mobileChatView: 'list',
+      projectView: 'list',
     };
   }
 
@@ -119,6 +121,8 @@
     var projOk = has(c.projectIds);
     if (r.activeProjectId != null && (!projOk || projOk(r.activeProjectId))) out.activeProjectId = r.activeProjectId;
     if (PROJECT_FILTERS.indexOf(r.projectStatusFilter) !== -1) out.projectStatusFilter = r.projectStatusFilter;
+    if (TASK_FILTERS.indexOf(r.taskStatusFilter) !== -1) out.taskStatusFilter = r.taskStatusFilter;
+    if (r.projectView === 'detail' && out.activeProjectId != null) out.projectView = 'detail';
     if (r.mobileChatView === 'thread' && (out.selectedConvId != null || out.pendingAgentId != null)) {
       out.mobileChatView = 'thread';
     }

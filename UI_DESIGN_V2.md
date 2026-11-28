@@ -150,13 +150,13 @@ Pane title "Agents" (serif) with a tabular `3/4 online` count, then a two-option
 ### 5.2 Agent summary row (collapsed by default)
 
 ```
-(D)● Dario @dario  [Consul] [busy]                [Chat] >
-     Opus 5.5 (high)   2 waiting
+(D)● Dario @dario  [Consul]              > [Chat]
+     [working] Opus 5.5 (high), 2 waiting
 ```
 
 - Avatar 32 px with the presence dot; gold ring when Consul.
-- Line 1: name, handle, Consul pill, one activity pill. Offline or revoked agents show "offline" or "revoked", never "idle" (spec 6.3).
-- Line 2, one line with ellipsis: model and effort, then waiting or unread counts when non-zero.
+- Line 1: name, handle, Consul pill. The name keeps priority; the handle shrinks first and is hidden on Consul rows narrower than 300 px (it stays in the drawer).
+- Line 2, one line with ellipsis: one activity pill, then model and effort, then waiting, unconfirmed or unread counts when non-zero. Offline or revoked agents show "offline" or "revoked", never "idle" (spec 6.3). The activity pill moved here from line 1 during Stage 2 QA: beside a 104 px rail the agent column is about 225 px wide, and two pills on line 1 truncated names to one letter.
 - Right: a "Chat" button (stops propagation) and a chevron. The whole row is a `<button aria-expanded>`; "Chat" is a sibling button, never nested.
 - Expanded drawer: last check-in, context meter, runtime and connector, delivery modes, image capability, waiting and unconfirmed counts, stream attached, address, pool selector, and "Message", "Revoke" (with confirmation) or "Re-admit".
 
@@ -272,10 +272,9 @@ iii. **Account pools:** add pool (provider, label, account label, subscription),
 
 Destructive actions (revoke, dismiss Consul, cancel invite) always confirm; survey anti-pattern: Paperclip places an unconfirmed Terminate next to Pause.
 
-### 7.2 Projects (reserved)
+### 7.2 Projects and tasks
 
-- Before the backend exists: a calm placeholder card, "Projects is ready and waiting for the server's /api/v1/projects endpoint", with no errors or alerts (spec QA-27).
-- After: master-detail per spec 8.3. Project cards show manager avatar, member stack, status pill and `done/total`. Task rows show priority, title, inline status select and assignee avatars. Assignee pickers list only project members; at least one assignee is required.
+- Master-detail per spec 8.3 (two columns from 960 px, list then detail with a back button on phones). Status filters for projects (all, active, paused, completed, archived) and tasks (all, open, in progress, in review, blocked, done) persist in view state. Project cards show manager avatar, member stack, status pill and `done/total`. Task rows show priority, title, inline status select and assignee avatars. Assignee pickers list only project members; at least one assignee is required.
 
 ## 8. Power-User Ergonomics (zero bloat)
 
@@ -293,7 +292,7 @@ Nothing else is bound by default; single-letter shortcuts are avoided so typing 
 
 ## 9. Implemented Modules on This Branch
 
-All modules are plain scripts that attach one global, use no dependencies, and are covered by tests (section 11). They are ready for the v4 wiring of `app.js` and do not change current behaviour until `index.html` includes them.
+All modules are plain scripts that attach one global, use no dependencies, and are covered by tests (section 11). Stage 2 wires them into `index.html` and `app.js` against the live v4 API (section 9.1).
 
 | File | Global and API | Covers |
 | --- | --- | --- |
@@ -303,7 +302,9 @@ All modules are plain scripts that attach one global, use no dependencies, and a
 | `static/avatar.js` + `avatar.css` | `LyraAvatar.el(principal, size, {status, consul, label})` with size `xs`, `sm`, `md` or `lg`; `stack`, `spec`, `initials`, `contrast` | Spec 4.3 |
 | `static/lifecycle.js` + `lifecycle.css` | `LyraLifecycle.phase(msg, {replied, now})`, `replied(msg, msgs)`, `render(msg, ctx, handlers)`, `update(el, msg, ctx, handlers)` | Section 6.7, spec 5 |
 
-### 9.1 Wiring plan for v4 (`app.js`, `index.html`, `app.css`)
+### 9.1 Wiring for v4 (`app.js`, `index.html`, `app.css`), done in Stage 2
+
+All seven steps below are implemented. `app.js` reads `/api/v1/board` and `/api/v1/conversations`, follows SSE (`presence`, `principal`, `invite`, `pool`, `project`, `message`, `message_state`, `message_progress`, `conversation`) with `?last=` replay, debounced refreshes and the reconnect banner, and keeps every node DOM-built (no HTML strings; event handlers only through `addEventListener`).
 
 i. `index.html`: viewport meta from spec 2.2; stylesheets `vendor/katex/katex.min.css`, then the module CSS, then `app.css`; scripts `vendor/katex/katex.min.js`, the five modules, then `app.js`, all `defer`.
 ii. Replace `renderBody` and `inline` in `app.js` with `LyraMarkdown.render(m.body)`.
@@ -326,26 +327,31 @@ vii. Rebuild `app.css` on the tokens in section 3 and the layouts in sections 4 
 - Drafts: `lyra.ui.v2.draft.conv:<id>` and `lyra.ui.v2.draft.pending:<agentId>`, value `{text, replyToId, mode, updatedAt}`; an empty text with no reply target deletes the key.
 - All access is wrapped: private-mode and quota errors fall back to an in-memory store and never throw.
 
-## 10. Server Prerequisites (not changed on this branch)
+## 10. Server Prerequisites (live on `upstream/main` since 855c1ec)
 
-Verified against `upstream/main` (`web.py`) and by the browser tests:
+All four were delivered upstream; this branch does not change `server/lyra_server/*.py`.
 
-| Prerequisite | Current behaviour | Needed |
-| --- | --- | --- |
-| Nested static paths | `_static()` rejects any `/` in the name, so `/static/vendor/katex/*` returns 404 | Segment-wise path checks (no empty, `.`, `..`, leading-dot or backslash segments), then `resources.files(...).joinpath('static', *parts)` |
-| Font MIME types | `.woff2` is served as `application/octet-stream` with `nosniff`, so browsers refuse it | Add `font/woff2`, `font/woff`, `font/ttf` and common image types; long-lived cache headers for `/static/vendor/` |
-| CSP for KaTeX | `style-src 'self'` blocks KaTeX's `style` attributes; `test_current_csp_blocks_katex_inline_styles` reproduces the violation | Add `style-src-attr 'unsafe-inline'` only; the browser suite passes with zero CSP violations under that header |
-| v2 data | Read receipts, pins, progress, hosts, avatars, pool account metadata, projects | API and SSE contract in spec 1.3 |
+| Prerequisite | Status |
+| --- | --- |
+| Nested static paths | Live: segment-wise checks, `/static/vendor/katex/*` served |
+| Font MIME types and caching | Live: `font/woff2` and friends, 7-day cache for `/static/vendor/` |
+| CSP for KaTeX | Live: `style-src-attr 'unsafe-inline'` only; `test_live_csp_allows_katex_and_blocks_unsafe_scripts_and_styles` proves KaTeX renders while inline scripts, handlers, `eval`, `data:` scripts and `<style>` elements stay blocked |
+| v4 data | Live: read cursors, pins, progress with stale flag, `presence.effective_status`, hosts, avatars, pool metadata, projects and tasks with `in_review` |
 
-The modules degrade safely until then: without KaTeX, math shows as TeX source; without progress events, the lifecycle stops at "Delivered"; without telemetry, hosts show "Unknown host".
+The modules still degrade safely: without KaTeX, math shows as TeX source; without progress, the lifecycle stops at "Delivered"; without telemetry, hosts show "Unknown host".
 
 ## 11. Verification
 
 - `server/tests/test_js_modules.py` runs with the normal server suite:
   - **Hygiene scan:** no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function` or style or event attributes in the modules, plus a check that the vendored KaTeX is present.
-  - **Engine tests** (`tests/js/test_engine.js`, 25 cases): parser, geometry, storage, avatar and lifecycle logic. Runs under JavaScriptCore (`jsc` on macOS) or Node (CI).
-  - **Browser tests** (`tests/js/test_dom.js`, 13 cases, plus the 25 engine cases in the page): set `LYRA_BROWSER_TESTS=1` with Chrome or Chromium installed. The page is served with the real Lyra CSP header and with the proposed v2 header. Covers XSS payloads (QA-02), KaTeX and currency (QA-20), wide tables on 390 px (QA-18), the dialog size, wheel anchoring, drag clamping, double-click, keyboard, pinch and double-tap (QA-06, QA-07), focus return, avatars (QA-12), lifecycle (QA-21, QA-22) and persistent drafts (QA-11).
-- `tests/js/gallery.html` and `tests/js/phone.html` are visual QA pages (desktop, dark, and true 390 x 844 frames); they are not served by Lyra.
+  - **Hygiene scan** also covers `app.js`, and a static check pins the live `web.CSP` to `'unsafe-inline'` for style attributes only.
+  - **Engine tests** (`tests/js/test_engine.js`, 27 cases): parser, geometry, storage, avatar (including server formats) and lifecycle (including server `state` bullets and the `stale` flag). Runs under JavaScriptCore (`jsc` on macOS) or Node (CI).
+  - **Browser tests** (`tests/js/test_dom.js`, 13 cases, plus the engine cases in the page): set `LYRA_BROWSER_TESTS=1` with Chrome or Chromium installed. Pages are served with the live Lyra CSP header; `tests/js/csp_probe.html` checks KaTeX against each blocked vector. Covers XSS payloads (QA-02), KaTeX and currency (QA-20), wide tables on 390 px (QA-18), the dialog size, wheel anchoring, drag clamping, double-click, keyboard, pinch and double-tap (QA-06, QA-07), focus return, avatars (QA-12), lifecycle (QA-21, QA-22) and persistent drafts (QA-11).
+- `server/tests/test_board_e2e.py` (opt-in with `LYRA_BROWSER_TESTS=1`) runs the wired board end to end. It seeds a real server through the public API (`tests/js/qa_board.py`: hosts with telemetry, pools with usage, Consul, every message lifecycle state, an image, pins, a team thread, projects with all five task states) and puts a test-only sign-in proxy in front, which can drop SSE streams. It then drives Chrome over the DevTools pipe (`tests/js/cdp.py`) at 1440 x 900 and at 390 x 844 (touch, DPR 2):
+  - `tests/js/qa/probe.js` steps through about 25 feature checks with DOM events only.
+  - Any page error, console error or CSP violation fails the test.
+  - `tests/js/qa_shots.py` captures light and dark screenshots; set `LYRA_QA_SHOTS=<dir>` to keep them.
+- `tests/js/gallery.html` and `tests/js/phone.html` remain the module-level visual QA pages; they are not served by Lyra.
 
 ## 12. Survey Notes and References
 
