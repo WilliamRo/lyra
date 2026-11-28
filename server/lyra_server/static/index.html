@@ -51,10 +51,10 @@
             <div id="messages" class="messages" aria-live="polite"></div>
             <form id="composer" class="composer" hidden>
               <div id="reply-to" class="reply-to" hidden></div>
-              <textarea id="compose-body" rows="3" placeholder="Write a message" required></textarea>
+              <textarea id="compose-body" rows="3" placeholder="Write a message (Ctrl+Enter to send)" required></textarea>
               <div class="composer-row">
                 <label>Delivery <select id="compose-mode"></select></label>
-                <button type="submit">Send</button>
+                <button id="compose-send" type="submit" title="Send (Ctrl+Enter)">Send</button>
               </div>
               <p id="compose-error" class="error" role="alert"></p>
             </form>

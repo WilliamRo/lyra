@@ -663,5 +663,17 @@ class SseAndBackupTests(ServerCase):
       backup.restore(out, target)
 
 
+  def test_composer_ctrl_enter_shortcut_present(self):
+    with urllib.request.urlopen(f'{self.base}/') as resp:
+      html = resp.read().decode('utf-8')
+    self.assertIn('placeholder="Write a message (Ctrl+Enter to send)"', html)
+    self.assertIn('id="compose-send"', html)
+    with urllib.request.urlopen(f'{self.base}/static/app.js') as resp:
+      js = resp.read().decode('utf-8')
+    self.assertIn("addEventListener('keydown'", js)
+    self.assertIn('ev.isComposing', js)
+    self.assertIn('requestSubmit()', js)
+
+
 if __name__ == '__main__':
   unittest.main()

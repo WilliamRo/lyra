@@ -2,7 +2,7 @@
 'use strict';
 
 const S = { me: null, board: null, convs: [], conv: null, msgs: [], usage: [], replyTo: null,
-  tab: 'board', es: null, timer: null };
+  tab: 'board', es: null, timer: null, sending: false };
 const QUICK = ['👍', '✅', '👀', '❤️', '😄'];
 const $ = (id) => document.getElementById(id);
 
@@ -349,12 +349,25 @@ function renderComposer() {
   }
 }
 
+$('compose-body').addEventListener('keydown', (ev) => {
+  if (ev.isComposing || ev.keyCode === 229) return;
+  if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+    ev.preventDefault();
+    if (!S.sending && $('compose-body').value.trim()) {
+      $('composer').requestSubmit();
+    }
+  }
+});
+
 $('composer').addEventListener('submit', async (ev) => {
   ev.preventDefault();
+  if (S.sending) return;
   $('compose-error').textContent = '';
   const body = $('compose-body').value;
   const mode = $('compose-mode').value || 'queue';
   const cid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
+  S.sending = true;
+  $('compose-send').disabled = true;
   try {
     let r;
     if (S.replyTo) r = await api('POST', `/api/v1/messages/${S.replyTo.id}/reply`, { body, mode, client_msg_id: cid });
@@ -367,6 +380,10 @@ $('composer').addEventListener('submit', async (ev) => {
     const convs = await api('GET', '/api/v1/conversations'); S.convs = convs.conversations;
     await loadConv(convId, true);
   } catch (e) { $('compose-error').textContent = e.message; }
+  finally {
+    S.sending = false;
+    $('compose-send').disabled = false;
+  }
 });
 
 async function toggleReaction(m, emoji, remove) {
