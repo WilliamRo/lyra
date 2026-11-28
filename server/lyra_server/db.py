@@ -11,7 +11,7 @@ import sqlite3
 import threading
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _schema_sql():
@@ -55,12 +55,10 @@ class Database:
     with self.lock:
       v = self._version()
       if v == 0:
-        self.conn.executescript('BEGIN;' + _schema_sql() + 'COMMIT;')
-        self.conn.execute(
-          "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
-          (str(SCHEMA_VERSION),),
-        )
-      elif v == 1:
+        self.conn.executescript('BEGIN;' + _schema_sql() +
+                                "INSERT INTO meta VALUES ('schema_version', '3'); COMMIT;")
+        return
+      if v == 1:
         self.conn.executescript(
           'BEGIN;'
           'ALTER TABLE principals ADD COLUMN role TEXT;'
@@ -68,11 +66,13 @@ class Database:
           "WHERE role = 'consul';"
           'ALTER TABLE invites ADD COLUMN issued_by_principal_id INTEGER;'
           'ALTER TABLE invites ADD COLUMN reason TEXT;'
-          'COMMIT;'
+          "UPDATE meta SET value='2' WHERE key='schema_version'; COMMIT;"
         )
-        self.conn.execute(
-          "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
-          (str(SCHEMA_VERSION),),
+        v = 2
+      if v == 2:
+        self.conn.executescript(
+          'BEGIN; ALTER TABLE presence ADD COLUMN capabilities TEXT;' + _schema_sql() +
+          "UPDATE meta SET value='3' WHERE key='schema_version'; COMMIT;"
         )
       elif v > SCHEMA_VERSION:
         raise RuntimeError(f'database schema {v} is newer than this server ({SCHEMA_VERSION})')

@@ -46,6 +46,7 @@ def checkin_payload(handle, cfg, pid):
   return {
     'instance_id': f'{socket.gethostname()}:{pid}', 'host': socket.gethostname(),
     'provider': cfg.get('provider', 'anthropic'), 'runtime': cfg.get('runtime', 'claude-code'),
+    'capabilities': {'images': bool(cfg.get('supports_images', True))},
     'connector': 'lyra-link', 'modes': modes, 'status': st, 'usage': usage,
   }
 

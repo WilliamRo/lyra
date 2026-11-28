@@ -3,6 +3,7 @@
 # Run: python3 -B -m unittest discover -s server/tests -t server
 # =============================================================================
 
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -55,7 +56,7 @@ class Client:
     self.last_headers = None
 
   def call(self, method, path, body=None, headers=None):
-    data = json.dumps(body).encode() if body is not None else None
+    data = body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(self.base + path, data=data, method=method)
     req.add_header('Content-Type', 'application/json')
     if self.origin:
@@ -67,7 +68,8 @@ class Client:
     try:
       with self.opener.open(req, timeout=30) as r:
         self.last_headers = r.headers
-        return r.status, json.loads(r.read() or b'{}')
+        raw = r.read()
+        return r.status, json.loads(raw or b'{}') if r.headers.get_content_type() == 'application/json' else raw
     except urllib.error.HTTPError as e:
       self.last_headers = e.headers
       raw = e.read()
@@ -184,7 +186,11 @@ class ConfigTests(unittest.TestCase):
   def test_toml_then_env_override(self):
     d = tmpdir()
     p = Path(d) / 'lyra.toml'
-    p.write_text(f'port = 9001\ndata_dir = "{d}"\nmessage_ttl_sec = 120\n')
+    p.write_text(f'port = 9001\ndata_dir = {json.dumps(d)}\nmessage_ttl_sec = 120\n')
+    if sys.version_info < (3, 11):
+      with self.assertRaisesRegex(config.ConfigError, 'TOML configuration requires'):
+        config.load(env={'LYRA_CONFIG': str(p)})
+      return
     s = config.validate(config.load(env={'LYRA_CONFIG': str(p), 'LYRA_PORT': '9002'}))
     self.assertEqual((s.port, s.message_ttl_sec, str(s.data_path)), (9002, 120, d))
 
@@ -477,7 +483,7 @@ class MessagingTests(ServerCase):
     payload = '<script>alert(1)</script><img src=x onerror=alert(1)> [x](javascript:alert(1))'
     st, rep = a.call('POST', '/api/v1/messages', {'to': 'owner', 'body': payload})
     self.assertEqual(rep['message']['body'], payload)
-    js = (ROOT / 'lyra_server' / 'static' / 'app.js').read_text()
+    js = (ROOT / 'lyra_server' / 'static' / 'app.js').read_text('utf-8')
     for sink in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'eval('):
       self.assertNotIn(sink, js, msg=f'unsafe sink {sink} in app.js')
     self.assertIn("(https:\\/\\/", js, msg='links must be restricted to https')
@@ -486,6 +492,140 @@ class MessagingTests(ServerCase):
 # =============================================================================
 # Delivery modes, leases, failures (brief s4, D4, walkthrough iv)
 # =============================================================================
+
+class AttachmentTests(ServerCase):
+  overrides = {'LYRA_MAX_ATTACHMENT_BYTES': '1024', 'LYRA_MAX_BODY_BYTES': '512'}
+  png = b'\x89PNG\r\n\x1a\n' + bytes(600)
+  endpoint = '/api/v1/attachments'
+
+  def upload(self, client, data=None):
+    st, result = client.call('POST', self.endpoint, self.png if data is None else data,
+                             {'X-Filename': '..%2F%22display%22%20name.txt'})
+    self.assertEqual(st, 200, result)
+    return result['attachment']
+
+  def test_formats_binary_limit_and_headers(self):
+    o = self.owner()
+    for data, mime in [(self.png, 'png'), (b'\xff\xd8\xff', 'jpeg'), (b'GIF87a', 'gif'),
+                       (b'GIF89a', 'gif'), (b'RIFF1234WEBP', 'webp')]:
+      with self.subTest(mime=mime):
+        image = self.upload(o, data)
+        self.assertEqual(set(image), {'id', 'url', 'mime_type', 'size_bytes', 'sha256', 'created_at', 'filename'})
+        self.assertEqual(image['mime_type'], 'image/' + mime)
+        self.assertEqual(image['size_bytes'], len(data))
+        self.assertEqual(image['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertNotIn('/', image['filename'])
+        self.assertEqual(o.call('GET', image['url']), (200, data))
+        self.assertEqual(o.last_headers['Content-Type'], image['mime_type'])
+        self.assertEqual(o.last_headers['X-Content-Type-Options'], 'nosniff')
+        self.assertIn("img-src 'self' data:", o.last_headers['Content-Security-Policy'])
+        self.assertTrue(o.last_headers['Content-Disposition'].startswith('inline; filename="'))
+        self.assertEqual(o.last_headers['Cache-Control'], 'private, max-age=86400')
+    for data, status, code in [(b'', 422, 'empty_attachment'), (self.png * 2, 413, 'attachment_too_large'),
+                               (b'<svg/>', 415, 'unsupported_media_type'), (b'<html>', 415, 'unsupported_media_type'),
+                               (b'RIFF1234FAKE', 415, 'unsupported_media_type')]:
+      st, res = o.call('POST', self.endpoint, data, {'Content-Type': 'image/png'})
+      self.assertEqual((st, res['error']), (status, code))
+    cfg = o.call('GET', '/api/v1/board')[1]['settings']
+    self.assertEqual((cfg['max_attachments_per_message'], cfg['max_attachment_bytes']), (4, 1024))
+
+  def test_access_before_and_after_binding(self):
+    o = self.owner()
+    a, b, outsider = (self.agent(o, h) for h in ('imgsender', 'imgreceiver', 'imgoutsider'))
+    self.checkin(b, capabilities={'images': True})
+    anon = Client(self.base)
+    self.assertEqual(anon.call('POST', self.endpoint, self.png)[0], 401)
+    self.assertEqual(o.call('POST', self.endpoint, self.png, {'Origin': 'https://elsewhere.invalid'})[0], 403)
+    image = self.upload(a)
+    for client in (o, b, outsider):
+      self.assertEqual(client.call('GET', image['url'])[0], 403)
+    self.assertEqual(a.call('GET', image['url']), (200, self.png))
+    self.assertEqual(a.call('POST', '/api/v1/messages', {'to': b.pid, 'attachment_ids': [image['id']]})[0], 200)
+    for client in (o, a, b):
+      self.assertEqual(client.call('GET', image['url']), (200, self.png))
+    self.assertEqual(outsider.call('GET', image['url'])[0], 403)
+    self.assertEqual(anon.call('GET', image['url'])[0], 401)
+
+  def test_image_only_send_replies_and_order(self):
+    o = self.owner()
+    a = self.agent(o, 'imgthread')
+    self.checkin(a, capabilities={'images': True})
+    ids = [self.upload(o)['id'], self.upload(o)['id']][::-1]
+    request = {'to': a.pid, 'attachment_ids': ids, 'client_msg_id': 'pictures'}
+    st, sent = o.call('POST', '/api/v1/messages', request)
+    self.assertEqual(st, 200, sent)
+    self.assertTrue(o.call('POST', '/api/v1/messages', request)[1]['duplicate'])
+    m = self.claim(a)['message']
+    self.assertEqual([i['id'] for i in m['attachments']], ids)
+    self.assertEqual(m['body'], '')
+    convs = o.call('GET', '/api/v1/conversations')[1]['conversations']
+    self.assertEqual(next(c for c in convs if c['id'] == m['conversation_id'])['last']['excerpt'], '[Image x2]')
+    rep = a.call('POST', f"/api/v1/messages/{m['id']}/reply", {'attachment_ids': [self.upload(a)['id']]})[1]['message']
+    self.assertEqual(rep['reply_to']['excerpt'], '[Image x2]')
+    reply_url = f"/api/v1/messages/{rep['id']}/reply"
+    quote = o.call('POST', reply_url, {'body': 'received'})[1]['message']
+    self.assertEqual((quote['reply_to']['excerpt'], quote['attachments']), ('[Image]', []))
+    self.checkin(a)
+    st, res = o.call('POST', reply_url, {'attachment_ids': [self.upload(o)['id']]})
+    self.assertEqual((st, res['error']), (422, 'recipient_no_images'))
+
+  def test_capability_gating_and_presence_event(self):
+    o = self.owner()
+    a = self.agent(o, 'imgtoggle')
+    aid = self.upload(o)['id']
+    body = {'to': a.pid, 'attachment_ids': [aid]}
+    st, error = o.call('POST', '/api/v1/messages', body)
+    self.assertEqual((st, error['error']), (422, 'recipient_no_images'))
+    self.assertEqual(o.call('POST', '/api/v1/messages', {'to': a.pid, 'body': 'text'})[0], 200)
+    n = self.app.events.latest_id()
+    self.checkin(a, capabilities={'images': True})
+    row = self.app.db.one("SELECT payload FROM events WHERE id>? AND type='presence'", (n,))
+    self.assertTrue(json.loads(row[0])['changed'])
+    self.assertTrue(self.board_agent(o, a.pid)['presence']['capabilities']['images'])
+    observer = self.agent(o, 'imgobserver')
+    mates = {p['handle']: p for p in observer.call('GET', '/api/v1/teammates')[1]['teammates']}
+    self.assertTrue(all(mates[h]['capabilities']['images'] for h in ('owner', a.handle)))
+    self.assertEqual(o.call('POST', '/api/v1/messages', body)[0], 200)
+    self.clock.advance(self.settings.checkin_ttl_sec + 1)
+    self.assertFalse(self.app.presence_view(a.pid)['capabilities']['images'])
+
+  def test_validation_ownership_and_atomic_reuse(self):
+    o = self.owner()
+    a = self.agent(o, 'imgbind')
+    self.checkin(a, capabilities={'images': True})
+    mine, theirs = self.upload(o)['id'], self.upload(a)['id']
+    def send(ids):
+      return o.call('POST', '/api/v1/messages', {'to': a.pid, 'attachment_ids': ids})
+    for ids, status, code in [([], 422, 'empty_body'), ([mine, mine], 422, 'bad_attachment_ids'),
+                              ([True], 422, 'bad_attachment_ids'), ([1, 2, 3, 4, 5], 422, 'bad_attachment_ids'),
+                              ([mine, 100000], 404, 'no_attachment'), ([mine, theirs], 403, 'attachment_forbidden')]:
+      st, res = send(ids)
+      self.assertEqual((st, res['error']), (status, code))
+    self.assertEqual(send([mine])[0], 200)
+    st, res = send([mine])
+    self.assertEqual((st, res['error']), (409, 'attachment_in_use'))
+
+  def test_orphan_sweep_and_backup_restore(self):
+    o = self.owner()
+    a = self.agent(o, 'imgbackup')
+    kept, orphan = self.upload(a), self.upload(a)
+    self.assertEqual(a.call('POST', '/api/v1/messages', {'to': 'owner', 'attachment_ids': [kept['id']]})[0], 200)
+    def path_for(image):
+      return self.app.db.one('SELECT storage_relpath FROM attachments WHERE id=?', (image['id'],))[0]
+    kept_path, old_path = path_for(kept), path_for(orphan)
+    self.clock.advance(self.settings.orphan_attachment_ttl_sec + 1)
+    self.app.sweep_once()
+    self.assertFalse((self.settings.attachments_path / old_path).exists())
+    replacement = self.upload(a)
+    self.assertGreater(replacement['id'], orphan['id'])
+    self.assertEqual(a.call('GET', orphan['url'])[0], 404)
+    self.assertEqual(o.call('GET', kept['url']), (200, self.png))
+    with tempfile.TemporaryDirectory() as d:
+      snapshot, target = Path(d) / 'archive.sqlite', Path(d) / 'restored' / 'lyra.sqlite'
+      info = backup.backup(self.settings.db_path, snapshot)
+      self.assertEqual(backup.restore(snapshot, target)['rows'], info['rows'])
+      self.assertEqual((target.parent / 'attachments' / kept_path).read_bytes(), self.png)
+
 
 class DeliveryTests(ServerCase):
 
@@ -761,7 +901,34 @@ class SenateAndConsulTests(ServerCase):
     self.assertEqual(a.call('POST', '/api/v1/consul/invites',
                             {'handle': 'x1', 'reason': 'after dismissal'})[0], 403)
 
-  def test_schema_v1_to_v2_migration_preserves_existing_data(self):
+  def test_schema_v2_to_v3_preserves_presence_and_messages(self):
+    from lyra_server.db import Database
+    with tempfile.TemporaryDirectory() as d:
+      path = Path(d) / 'v2.sqlite'
+      conn = sqlite3.connect(str(path))
+      conn.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        INSERT INTO meta VALUES ('schema_version','2');
+        CREATE TABLE presence (principal_id INTEGER PRIMARY KEY, instance_id TEXT, host TEXT,
+          provider TEXT, runtime TEXT, connector TEXT, modes TEXT, status TEXT, last_checkin_at REAL,
+          online INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO presence(principal_id, host, online) VALUES(8, 'original', 1);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY, recipient_id INTEGER, state TEXT, priority INTEGER,
+          created_at REAL, conversation_id INTEGER, body TEXT);
+        INSERT INTO messages VALUES (12, 8, 'delivered', 1, 2, 7, 'original message');
+      """)
+      conn.close()
+      db = Database(path)
+      try:
+        self.assertEqual(tuple(db.one('SELECT host, capabilities FROM presence')), ('original', None))
+        self.assertEqual(db.one('SELECT body FROM messages WHERE id=12')[0], 'original message')
+        self.assertEqual(db._version(), 3)
+        self.assertEqual(db.all('SELECT * FROM attachments'), [])
+        self.assertTrue(db.one("SELECT 1 FROM sqlite_master WHERE name='ix_message_attachments_msg'"))
+      finally:
+        db.close()
+
+  def test_schema_v1_to_v3_migration_preserves_existing_data(self):
     from lyra_server.db import Database, SCHEMA_VERSION
     d = tmpdir()
     db_path = Path(d) / 'v1.sqlite'
@@ -817,7 +984,10 @@ class SenateAndConsulTests(ServerCase):
     db = Database(db_path)
     try:
       ver = db.one("SELECT value FROM meta WHERE key='schema_version'")[0]
-      self.assertEqual(int(ver), SCHEMA_VERSION)
+      self.assertEqual(int(ver), 3)
+      self.assertEqual(SCHEMA_VERSION, 3)
+      self.assertIn('capabilities', [r['name'] for r in db.all('PRAGMA table_info(presence)')])
+      self.assertEqual(db.all('SELECT * FROM message_attachments'), [])
       gem = db.one("SELECT handle, role FROM principals WHERE id=2")
       self.assertEqual((gem['handle'], gem['role']), ('gem', None))
       with db.tx() as c:

@@ -2,7 +2,7 @@
 'use strict';
 
 const S = { me: null, board: null, convs: [], conv: null, msgs: [], usage: [], replyTo: null,
-  tab: 'board', es: null, timer: null, sending: false };
+  tab: 'board', es: null, timer: null, sending: false, staged: [], navigation: 0 };
 const QUICK = ['👍', '✅', '👀', '❤️', '😄'];
 const $ = (id) => document.getElementById(id);
 
@@ -75,9 +75,10 @@ function renderBody(text) {
 
 // --- API ------------------------------------------------------------------
 
-async function api(method, path, body) {
-  const opts = { method, credentials: 'same-origin', headers: {} };
-  if (body !== undefined) {
+async function api(method, path, body, headers = {}) {
+  const opts = { method, credentials: 'same-origin', headers };
+  if (body instanceof File) opts.body = body;
+  else if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
@@ -96,6 +97,7 @@ async function api(method, path, body) {
 // --- session --------------------------------------------------------------
 
 function showLogin() {
+  switchDraft(); S.conv = null;
   $('main').hidden = true; $('login').hidden = false;
   if (S.es) { S.es.close(); S.es = null; }
 }
@@ -149,7 +151,8 @@ async function refreshAll() {
     api('GET', '/api/v1/board'), api('GET', '/api/v1/conversations'), api('GET', '/api/v1/usage')]);
   S.board = board; S.convs = convs.conversations; S.usage = usage.providers;
   renderRoster(); renderConvList(); renderUsage(); renderAdmin(); renderSenate();
-  if (S.conv) await loadConv(S.conv.id, true);
+  if (S.conv?.id) await loadConv(S.conv.id, true);
+  else if (S.conv) renderConv();
 }
 
 // --- tabs -----------------------------------------------------------------
@@ -162,6 +165,10 @@ function setTab(tab) {
 document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => setTab(b.dataset.tab)));
 
 // --- roster ---------------------------------------------------------------
+
+function agentSupportsImages(agent) {
+  return agent?.presence?.capabilities?.images === true;
+}
 
 function agentCard(a) {
   const p = a.presence || {}; const st = p.status || {};
@@ -198,6 +205,7 @@ function agentCard(a) {
       h('span', { text: `model ${unknown(st.model)}${st.effort ? ` (${st.effort})` : ''}` }),
       h('span', { text: `context ${ctx}` }),
       h('span', { text: `delivery ${modes}` }),
+      h('span', { text: agentSupportsImages(a) ? 'images' : 'text-only' }),
       h('span', { text: `waiting ${a.waiting}${a.unconfirmed ? `, unconfirmed ${a.unconfirmed}` : ''}` })),
     h('div', { class: 'agent-meta' },
       h('span', { text: `${unknown(p.provider)} / ${unknown(p.runtime)} / ${unknown(p.connector)}` }),
@@ -263,14 +271,31 @@ function openWith(agent) {
   const c = S.convs.find((x) => x.kind === 'owner_agent' && x.members.some((m) => m.id === agent.id));
   setTab('chats');
   if (c) { loadConv(c.id); return; }
+  if (S.conv?.pendingTo?.id !== agent.id) switchDraft();
   S.conv = { id: null, kind: 'owner_agent', pendingTo: agent };
   S.msgs = []; S.replyTo = null;
   renderConv();
 }
 
+function switchDraft() {
+  S.navigation++;
+  S.staged = [];
+  S.replyTo = null;
+  $('compose-body').value = '';
+  $('compose-files').value = '';
+  $('compose-error').textContent = '';
+}
+
 async function loadConv(id, quiet) {
+  if (!quiet && S.conv?.id !== id) {
+    switchDraft();
+    S.conv = null;
+    renderConv();
+  }
+  const navigation = S.navigation;
   try {
     const r = await api('GET', `/api/v1/conversations/${id}/messages`);
+    if (navigation !== S.navigation) return;
     const meta = S.convs.find((c) => c.id === id) || {};
     S.conv = { id, kind: r.kind, read_only: r.read_only, members: meta.members || [] };
     S.msgs = r.messages;
@@ -281,7 +306,7 @@ async function loadConv(id, quiet) {
 
 function recipientAgent() {
   if (!S.conv) return null;
-  if (S.conv.pendingTo) return S.conv.pendingTo;
+  if (S.conv.pendingTo) return S.board.agents.find((a) => a.id === S.conv.pendingTo.id);
   const m = (S.conv.members || []).find((x) => x.kind === 'agent');
   return m ? (S.board.agents || []).find((a) => a.id === m.id) : null;
 }
@@ -327,17 +352,104 @@ function renderConv() {
         m.mode === 'jump' ? h('span', { class: 'pill', text: 'Jump queue' }) : null,
         m.retry ? h('span', { class: 'pill', text: 'retried' }) : null),
       m.reply_to ? h('div', { class: 'quote', text: `${m.reply_to.sender_name}: ${m.reply_to.excerpt}` }) : null,
-      h('div', { class: 'msg-body' }, renderBody(m.body)), foot));
+      m.body ? h('div', { class: 'msg-body' }, renderBody(m.body)) : null,
+      h('div', { class: 'image-strip' }, (m.attachments || []).map(imageLink)), foot));
   }
   root.scrollTop = root.scrollHeight;
   renderComposer();
 }
+
+function imageLink(image) {
+  const url = '/api/v1/attachments/' + Number(image.id);
+  return h('a', { href: url, target: '_blank', rel: 'noopener noreferrer' },
+    h('img', { src: url, alt: image.filename, loading: 'lazy' }));
+}
+
+function imageExcerpt(m) {
+  const n = (m.attachments || []).length;
+  return m.body.trim() ? m.body.slice(0, 80) : n === 1 ? '[Image]' : '[Image x' + n + ']';
+}
+
+function renderImages() {
+  const allowed = agentSupportsImages(recipientAgent());
+  const note = $('compose-image-note');
+  note.hidden = allowed;
+  note.textContent = allowed ? '' : 'Image sending is disabled for this agent (text-only).';
+  const attach = $('compose-attach');
+  attach.disabled = !allowed || S.sending;
+  attach.title = allowed ? '' : 'Images disabled: this agent does not support image input';
+  if (!allowed && S.staged.length) S.staged = [];
+  const strip = clear($('compose-attachments'));
+  for (const item of S.staged) {
+    strip.append(h('div', { class: 'staged-image' },
+      item.image ? imageLink(item.image) : h('span', { text: 'Uploading ' + item.name }),
+      h('button', { type: 'button', class: 'link', disabled: S.sending,
+        'aria-label': 'Remove ' + item.name, onclick: () => {
+          S.staged.splice(S.staged.indexOf(item), 1);
+          renderImages();
+        } }, 'Remove')));
+  }
+  $('compose-send').disabled = S.sending || S.staged.some(item => !item.image)
+    || !($('compose-body').value.trim() || S.staged.length);
+}
+
+async function stageImages(files) {
+  const error = $('compose-error');
+  if (!agentSupportsImages(recipientAgent()) || S.conv?.read_only) {
+    error.textContent = 'Image sending is disabled for this agent (text-only).';
+    return;
+  }
+  if (S.sending) return;
+  error.textContent = '';
+  const staged = S.staged;
+  const settings = S.board.settings;
+  if (staged.length + files.length > settings.max_attachments_per_message) {
+    error.textContent = 'You can attach up to ' + settings.max_attachments_per_message + ' images.';
+    return;
+  }
+  for (const file of files) {
+    if (file.size > settings.max_attachment_bytes || !file.size) {
+      error.textContent = file.name + ' is empty or exceeds the image size limit.';
+      continue;
+    }
+    const item = { name: file.name };
+    staged.push(item);
+    renderImages();
+    api('POST', '/api/v1/attachments', file, { 'X-Filename': encodeURIComponent(file.name) })
+      .then(r => { item.image = r.attachment; })
+      .catch(e => {
+        if (staged === S.staged && staged.includes(item)) {
+          staged.splice(staged.indexOf(item), 1);
+          error.textContent = e.message;
+        }
+      }).finally(() => { if (staged === S.staged) renderImages(); });
+  }
+}
+
+$('compose-attach').addEventListener('click', () => $('compose-files').click());
+$('compose-files').addEventListener('change', ev => {
+  stageImages(Array.from(ev.target.files));
+  ev.target.value = '';
+});
+$('composer').addEventListener('paste', ev => {
+  const files = Array.from(ev.clipboardData.files);
+  if (files.length) { ev.preventDefault(); stageImages(files); }
+});
+$('composer').addEventListener('dragover', ev => {
+  if (ev.dataTransfer.types.includes('Files')) ev.preventDefault();
+});
+$('composer').addEventListener('drop', ev => {
+  const files = Array.from(ev.dataTransfer.files);
+  if (files.length) { ev.preventDefault(); stageImages(files); }
+});
+$('compose-body').addEventListener('input', renderImages);
 
 function renderComposer() {
   const ro = S.conv && (S.conv.read_only || S.conv.kind === 'agent_agent');
   $('read-only').hidden = !ro;
   $('composer').hidden = !S.conv || ro;
   if (!S.conv || ro) return;
+  renderImages();
   const agent = recipientAgent();
   const modes = (agent && agent.presence && agent.presence.modes) || ['queue'];
   const sel = clear($('compose-mode'));
@@ -345,7 +457,7 @@ function renderComposer() {
   const rt = clear($('reply-to'));
   rt.hidden = !S.replyTo;
   if (S.replyTo) {
-    rt.append(h('span', { text: `Replying to ${S.replyTo.sender.display_name}: ${S.replyTo.body.slice(0, 80)}` }),
+    rt.append(h('span', { text: `Replying to ${S.replyTo.sender.display_name}: ${imageExcerpt(S.replyTo)}` }),
       h('button', { class: 'link', onclick: () => { S.replyTo = null; renderComposer(); } }, 'cancel'));
   }
 }
@@ -354,7 +466,7 @@ $('compose-body').addEventListener('keydown', (ev) => {
   if (ev.isComposing || ev.keyCode === 229) return;
   if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
     ev.preventDefault();
-    if (!S.sending && $('compose-body').value.trim()) {
+    if (!$('compose-send').disabled) {
       $('composer').requestSubmit();
     }
   }
@@ -362,28 +474,32 @@ $('compose-body').addEventListener('keydown', (ev) => {
 
 $('composer').addEventListener('submit', async (ev) => {
   ev.preventDefault();
-  if (S.sending) return;
+  if ($('compose-send').disabled || !S.conv || S.conv.read_only) return;
+  const draft = S.staged;
+  const attachment_ids = draft.map(item => item.image.id);
   $('compose-error').textContent = '';
   const body = $('compose-body').value;
   const mode = $('compose-mode').value || 'queue';
   const cid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : String(Date.now());
   S.sending = true;
-  $('compose-send').disabled = true;
+  renderImages();
   try {
     let r;
-    if (S.replyTo) r = await api('POST', `/api/v1/messages/${S.replyTo.id}/reply`, { body, mode, client_msg_id: cid });
+    if (S.replyTo) r = await api('POST', `/api/v1/messages/${S.replyTo.id}/reply`, { body, mode, attachment_ids, client_msg_id: cid });
     else {
       const agent = recipientAgent();
-      r = await api('POST', '/api/v1/messages', { to: agent.id, body, mode, client_msg_id: cid });
+      r = await api('POST', '/api/v1/messages', { to: agent.id, body, mode, attachment_ids, client_msg_id: cid });
     }
+    if (draft !== S.staged) return;
+    S.staged = []; const navigation = S.navigation;
     $('compose-body').value = ''; S.replyTo = null;
     const convId = r.message.conversation_id;
     const convs = await api('GET', '/api/v1/conversations'); S.convs = convs.conversations;
-    await loadConv(convId, true);
-  } catch (e) { $('compose-error').textContent = e.message; }
+    if (navigation === S.navigation) await loadConv(convId, true);
+  } catch (e) { if (draft === S.staged) $('compose-error').textContent = e.message; }
   finally {
     S.sending = false;
-    $('compose-send').disabled = false;
+    renderComposer();
   }
 });
 

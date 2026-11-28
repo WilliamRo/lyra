@@ -21,6 +21,10 @@ def _clip(value, limit):
   return str(value).strip()[:limit] or None
 
 
+def clean_capabilities(caps):
+  return {'images': bool(caps.get('images', False)) if isinstance(caps, dict) else False}
+
+
 def clean_modes(modes):
   out = [m for m in MODES if m in (modes or [])]
   return out if 'queue' in out else ['queue'] + [m for m in out if m != 'queue']
@@ -327,15 +331,15 @@ class RegistryMixin:
       pid, _clip(data.get('instance_id'), 120), _clip(data.get('host'), 120),
       _clip(data.get('provider'), 40), _clip(data.get('runtime'), 40),
       _clip(data.get('connector'), 60), dumps(clean_modes(data.get('modes'))), dumps(status),
-      now if online else None, 1 if online else 0,
+      dumps(clean_capabilities(data.get('capabilities'))), now if online else None, 1 if online else 0,
     )
     c.execute(
       'INSERT INTO presence(principal_id, instance_id, host, provider, runtime, connector, modes, '
-      'status, last_checkin_at, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+      'status, capabilities, last_checkin_at, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
       'ON CONFLICT(principal_id) DO UPDATE SET instance_id=excluded.instance_id, '
       'host=COALESCE(excluded.host, host), provider=COALESCE(excluded.provider, provider), '
       'runtime=COALESCE(excluded.runtime, runtime), connector=COALESCE(excluded.connector, connector), '
-      'modes=excluded.modes, status=excluded.status, '
+      'modes=excluded.modes, status=excluded.status, capabilities=excluded.capabilities, '
       'last_checkin_at=COALESCE(excluded.last_checkin_at, last_checkin_at), online=excluded.online',
       row,
     )
@@ -356,10 +360,11 @@ class RegistryMixin:
       old_status = loads(prev['status'], {}) if prev else {}
       was_online = bool(prev and prev['online'])
       self._upsert_presence(c, pid, data, now, online=True)
-      cur = c.execute('SELECT modes, status FROM presence WHERE principal_id=?', (pid,)).fetchone()
+      cur = c.execute('SELECT modes, status, capabilities FROM presence WHERE principal_id=?', (pid,)).fetchone()
       if not was_online:
         self.events.append(c, 'presence', id=pid, online=True)
-      elif loads(cur['modes'], []) != old_modes or \
+      elif clean_capabilities(loads(prev['capabilities'])) != loads(cur['capabilities']) or \
+          loads(cur['modes'], []) != old_modes or \
           loads(cur['status'], {}).get('busy') != old_status.get('busy'):
         self.events.append(c, 'presence', id=pid, online=True, changed=True)
       # i. Only the pool's designated reporter may write pool usage.
@@ -391,15 +396,20 @@ class RegistryMixin:
   def presence_view(self, pid):
     r = self.db.one('SELECT * FROM presence WHERE principal_id=?', (pid,))
     if not r:
-      return {'online': False, 'last_checkin_at': None, 'modes': ['queue'], 'status': {}}
-    online = bool(r['last_checkin_at'] and self.now() - r['last_checkin_at']
+      return {'online': False, 'last_checkin_at': None, 'modes': ['queue'], 'status': {},
+              'capabilities': clean_capabilities(None)}
+    online = bool(r['online'] and r['last_checkin_at'] is not None and self.now() - r['last_checkin_at']
                   <= self.settings.checkin_ttl_sec)
     return {
       'online': online, 'last_checkin_at': r['last_checkin_at'], 'instance_id': r['instance_id'],
       'host': r['host'], 'provider': r['provider'], 'runtime': r['runtime'],
       'connector': r['connector'], 'modes': loads(r['modes'], ['queue']),
       'status': loads(r['status'], {}),
+      'capabilities': clean_capabilities(loads(r['capabilities']) if online else None),
     }
+
+  def recipient_supports_images(self, pid):
+    return self.presence_view(pid)['capabilities']['images']
 
   def recipient_modes(self, pid):
     return self.presence_view(pid)['modes']
@@ -414,6 +424,7 @@ class RegistryMixin:
         'handle': p['handle'], 'display_name': p['display_name'], 'kind': p['kind'],
         'role': p['role'],
         'online': pres['online'] if pres else None,
+        'capabilities': pres['capabilities'] if pres else {'images': True},
         'modes': pres['modes'] if pres else ['queue'],
         'busy': (pres['status'] or {}).get('busy') if pres else None,
       })

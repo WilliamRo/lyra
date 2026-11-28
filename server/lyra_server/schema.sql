@@ -1,11 +1,11 @@
--- Lyra schema version 1. Applied once; later versions add numbered migrations.
+-- Current schema. Versioned migrations add missing columns before applying this DDL.
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
 
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE users (
   created_at REAL NOT NULL
 );
 
-CREATE TABLE web_sessions (
+CREATE TABLE IF NOT EXISTS web_sessions (
   id_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL,
   persistent INTEGER NOT NULL,
@@ -24,7 +24,7 @@ CREATE TABLE web_sessions (
   expires_at REAL NOT NULL
 );
 
-CREATE TABLE pools (
+CREATE TABLE IF NOT EXISTS pools (
   id INTEGER PRIMARY KEY,
   provider TEXT NOT NULL,
   label TEXT NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE pools (
 );
 
 -- Durable identities; conversations attach here, never to credentials.
-CREATE TABLE principals (
+CREATE TABLE IF NOT EXISTS principals (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,              -- owner | agent
   handle TEXT,
@@ -49,15 +49,15 @@ CREATE TABLE principals (
   admitted_at REAL,
   revoked_at REAL
 );
-CREATE UNIQUE INDEX uq_principal_active_address
+CREATE UNIQUE INDEX IF NOT EXISTS uq_principal_active_address
   ON principals(address) WHERE status = 'admitted' AND address IS NOT NULL;
-CREATE UNIQUE INDEX uq_principal_active_handle
+CREATE UNIQUE INDEX IF NOT EXISTS uq_principal_active_handle
   ON principals(handle) WHERE status = 'admitted' AND handle IS NOT NULL;
-CREATE UNIQUE INDEX uq_principal_consul
+CREATE UNIQUE INDEX IF NOT EXISTS uq_principal_consul
   ON principals(role) WHERE role = 'consul';
 
 -- Rotatable credentials; at most one active per principal.
-CREATE TABLE credentials (
+CREATE TABLE IF NOT EXISTS credentials (
   id INTEGER PRIMARY KEY,
   principal_id INTEGER NOT NULL,
   token_hash TEXT NOT NULL UNIQUE,
@@ -66,10 +66,10 @@ CREATE TABLE credentials (
   created_at REAL NOT NULL,
   revoked_at REAL
 );
-CREATE UNIQUE INDEX uq_credential_active
+CREATE UNIQUE INDEX IF NOT EXISTS uq_credential_active
   ON credentials(principal_id) WHERE status = 'active';
 
-CREATE TABLE invites (
+CREATE TABLE IF NOT EXISTS invites (
   id INTEGER PRIMARY KEY,
   code_hash TEXT NOT NULL UNIQUE,
   display_name TEXT,
@@ -86,7 +86,7 @@ CREATE TABLE invites (
   reason TEXT
 );
 
-CREATE TABLE presence (
+CREATE TABLE IF NOT EXISTS presence (
   principal_id INTEGER PRIMARY KEY,
   instance_id TEXT,
   host TEXT,
@@ -95,24 +95,25 @@ CREATE TABLE presence (
   connector TEXT,
   modes TEXT,
   status TEXT,
+  capabilities TEXT,
   last_checkin_at REAL,
   online INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE conversations (
+CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,              -- owner_agent | agent_agent
   dm_pair_key TEXT NOT NULL UNIQUE,
   created_at REAL NOT NULL
 );
 
-CREATE TABLE conversation_members (
+CREATE TABLE IF NOT EXISTS conversation_members (
   conversation_id INTEGER NOT NULL,
   principal_id INTEGER NOT NULL,
   PRIMARY KEY (conversation_id, principal_id)
 );
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
   conversation_id INTEGER NOT NULL,
   sender_id INTEGER NOT NULL,
@@ -133,10 +134,10 @@ CREATE TABLE messages (
   failed_at REAL,
   UNIQUE (sender_id, client_msg_id)
 );
-CREATE INDEX ix_messages_queue ON messages(recipient_id, state, priority DESC, created_at);
-CREATE INDEX ix_messages_conv ON messages(conversation_id, id);
+CREATE INDEX IF NOT EXISTS ix_messages_queue ON messages(recipient_id, state, priority DESC, created_at);
+CREATE INDEX IF NOT EXISTS ix_messages_conv ON messages(conversation_id, id);
 
-CREATE TABLE delivery_attempts (
+CREATE TABLE IF NOT EXISTS delivery_attempts (
   id INTEGER PRIMARY KEY,
   message_id INTEGER NOT NULL,
   lease_id TEXT NOT NULL UNIQUE,
@@ -146,7 +147,7 @@ CREATE TABLE delivery_attempts (
   outcome_at REAL
 );
 
-CREATE TABLE reactions (
+CREATE TABLE IF NOT EXISTS reactions (
   message_id INTEGER NOT NULL,
   reactor_id INTEGER NOT NULL,
   emoji TEXT NOT NULL,
@@ -155,9 +156,27 @@ CREATE TABLE reactions (
 );
 
 -- Change log for SSE replay: transitions only, never routine check-ins.
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts REAL NOT NULL,
   type TEXT NOT NULL,
   payload TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS attachments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  uploader_id INTEGER NOT NULL REFERENCES principals(id),
+  sha256 TEXT NOT NULL,
+  mime_type TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  storage_relpath TEXT NOT NULL UNIQUE,
+  created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS message_attachments (
+  message_id INTEGER NOT NULL REFERENCES messages(id),
+  attachment_id INTEGER NOT NULL UNIQUE REFERENCES attachments(id),
+  position INTEGER NOT NULL,
+  PRIMARY KEY (message_id, attachment_id)
+);
+CREATE INDEX IF NOT EXISTS ix_message_attachments_msg ON message_attachments(message_id, position);

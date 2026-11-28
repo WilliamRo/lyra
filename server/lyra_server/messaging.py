@@ -69,10 +69,12 @@ class MessagingMixin:
 
   # --- send and reply ------------------------------------------------------
 
-  def send(self, sender, to, body, mode=None, client_msg_id=None, reply_to_id=None):
+  def send(self, sender, to, body, mode=None, client_msg_id=None, reply_to_id=None,
+           attachment_ids=None):
     """Sender always comes from the credential, never from the request body."""
     body = str(body or '')
-    if not body.strip():
+    ids = self.validate_attachment_ids(attachment_ids)
+    if not body.strip() and not ids:
       raise ApiError(422, 'empty_body', 'message body is empty')
     if len(body) > self.settings.max_message_chars:
       raise ApiError(413, 'body_too_long', 'message is too long')
@@ -113,6 +115,8 @@ class MessagingMixin:
       if mode not in PRIORITY:
         raise ApiError(422, 'bad_mode', 'mode must be queue or jump')
       if recipient['kind'] == 'agent':
+        if ids and not self.recipient_supports_images(recipient['id']):
+          raise ApiError(422, 'recipient_no_images', 'recipient does not support image attachments')
         modes = self.recipient_modes(recipient['id'])
         if mode not in modes:
           raise ApiError(422, 'mode_unsupported', f'recipient supports only {modes}',
@@ -138,6 +142,7 @@ class MessagingMixin:
         (conv['id'], sender['id'], recipient['id'], body, reply_to_id, mode, PRIORITY[mode],
          'delivered' if to_owner else 'waiting', client_msg_id, now, now if to_owner else None),
       )
+      self.bind_attachments(c, ids, cur.lastrowid, sender['id'])
       self.events.append(c, 'message', id=cur.lastrowid, conversation_id=conv['id'],
                          state='delivered' if to_owner else 'waiting')
       view = self.message_view(cur.lastrowid, c=c)
@@ -146,9 +151,9 @@ class MessagingMixin:
       self.delivery_cv_notify()
     return {'message': view, 'duplicate': False}
 
-  def reply(self, sender, message_id, body, mode=None, client_msg_id=None):
+  def reply(self, sender, message_id, body, mode=None, client_msg_id=None, attachment_ids=None):
     return self.send(sender, None, body, mode=mode, client_msg_id=client_msg_id,
-                     reply_to_id=int(message_id))
+                     reply_to_id=int(message_id), attachment_ids=attachment_ids)
 
   # --- reactions -----------------------------------------------------------
 
@@ -198,7 +203,7 @@ class MessagingMixin:
             'ON p.id = m.sender_id WHERE m.id=?')
       o = c.execute(qq, (m['reply_to_id'],)).fetchone() if c else self.db.one(qq, (m['reply_to_id'],))
       if o:
-        reply_to = {'id': o['id'], 'sender_name': o['display_name'], 'excerpt': o['body'][:160]}
+        reply_to = {'id': o['id'], 'sender_name': o['display_name'], 'excerpt': self.excerpt(o, 160)}
     return {
       'id': m['id'], 'conversation_id': m['conversation_id'],
       'conversation_kind': m['conversation_kind'],
@@ -206,6 +211,7 @@ class MessagingMixin:
                  'handle': m['sender_handle'], 'kind': m['sender_kind']},
       'recipient': {'id': m['recipient_id'], 'display_name': m['recipient_name'],
                     'handle': m['recipient_handle'], 'kind': m['recipient_kind']},
+      'attachments': self.message_attachments(mid),
       'body': m['body'], 'reply_to': reply_to, 'mode': m['mode'], 'state': m['state'],
       'state_reason': m['state_reason'], 'attempts': m['attempts'], 'retry': bool(m['retry']),
       'created_at': m['created_at'], 'delivered_at': m['delivered_at'],
@@ -241,7 +247,7 @@ class MessagingMixin:
         'id': cv['id'], 'kind': cv['kind'],
         'members': [dict(m) for m in members],
         'read_only': viewer['kind'] == 'owner' and viewer['id'] not in member_ids,
-        'last': ({'id': last['id'], 'excerpt': last['body'][:120], 'created_at': last['created_at'],
+        'last': ({'id': last['id'], 'excerpt': self.excerpt(last, 120), 'created_at': last['created_at'],
                   'sender_id': last['sender_id']} if last else None),
       })
     out.sort(key=lambda x: -(x['last']['created_at'] if x['last'] else 0))

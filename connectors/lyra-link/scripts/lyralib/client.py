@@ -4,11 +4,14 @@
 
 import ipaddress
 import json
+from pathlib import Path
 import ssl
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
+
+from . import store
 
 
 class LyraError(Exception):
@@ -53,18 +56,25 @@ class Client:
       handlers.append(urllib.request.ProxyHandler({}))  # never route loopback via a proxy
     self.opener = urllib.request.build_opener(*handlers)
 
-  def request(self, method, path, body=None, timeout=None, retries=2):
+  def request(self, method, path, body=None, timeout=None, retries=2, *, raw_body=None,
+              headers=None, binary=False):
     data = json.dumps(body).encode('utf-8') if body is not None else None
+    if raw_body is not None:
+      data = raw_body
     last = None
     for attempt in range(retries + 1):
       req = urllib.request.Request(self.base + path, data=data, method=method)
       req.add_header('Content-Type', 'application/json')
-      req.add_header('Accept', 'application/json')
+      req.add_header('Accept', 'image/*' if binary else 'application/json')
+      for name, value in (headers or {}).items():
+        req.add_header(name, value)
       if self.token:
         req.add_header('Authorization', f'Bearer {self.token}')
       try:
         with self.opener.open(req, timeout=timeout or self.timeout) as r:
           raw = r.read()
+          if binary:
+            return raw
           return json.loads(raw) if raw else {}
       except urllib.error.HTTPError as e:
         raw = e.read()
@@ -101,13 +111,26 @@ class Client:
     return self.request('POST', f'/api/v1/deliveries/{lease_id}/{outcome}',
                         {'reason': reason} if reason else {})
 
-  def send(self, to, body, mode=None, client_msg_id=None):
-    return self.request('POST', '/api/v1/messages',
-                        {'to': to, 'body': body, 'mode': mode, 'client_msg_id': client_msg_id})
+  def upload_attachment(self, path):
+    path = Path(path)
+    result = self.request('POST', '/api/v1/attachments', raw_body=path.read_bytes(), retries=0,
+                          headers={'X-Filename': quote(path.name, safe=''),
+                                   'Content-Type': 'application/octet-stream'})
+    return result['attachment']
 
-  def reply(self, mid, body, mode=None, client_msg_id=None):
+  def download_attachment(self, attachment_id, dest_path):
+    data = self.request('GET', f'/api/v1/attachments/{int(attachment_id)}', binary=True)
+    store.atomic_write_bytes(dest_path, data)
+
+  def send(self, to, body, mode=None, client_msg_id=None, attachment_ids=None):
+    return self.request('POST', '/api/v1/messages',
+                        {'to': to, 'body': body, 'mode': mode, 'client_msg_id': client_msg_id,
+                         'attachment_ids': attachment_ids or []})
+
+  def reply(self, mid, body, mode=None, client_msg_id=None, attachment_ids=None):
     return self.request('POST', f'/api/v1/messages/{int(mid)}/reply',
-                        {'body': body, 'mode': mode, 'client_msg_id': client_msg_id})
+                        {'body': body, 'mode': mode, 'client_msg_id': client_msg_id,
+                         'attachment_ids': attachment_ids or []})
 
   def react(self, mid, emoji, remove=False):
     from urllib.parse import quote

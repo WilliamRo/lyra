@@ -3,6 +3,8 @@
 # Run: python3 -B .claude/skills/lyra-link/scripts/test_lyra_link.py
 # =============================================================================
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -10,10 +12,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lyralib import activity, client, status, store, stream  # noqa: E402
+import lyra_link
+from lyralib import activity, client, daemon, link, status, store, stream  # noqa: E402
 from lyralib.client import LyraError  # noqa: E402
 
 SELF = os.getpid()
@@ -96,6 +100,65 @@ class ClientTests(unittest.TestCase):
       client.check_url('http://lyra.example')
 
 
+class ImageConnectorTests(Base):
+  def test_join_and_checkin_capabilities(self):
+    for handle, enabled in [('vision', True), ('plain', False)]:
+      with patch.object(link, 'Client') as factory:
+        remote = factory.return_value
+        remote.base = 'http://localhost'
+        remote.join.return_value = {'token': 'test', 'principal': {'handle': handle},
+                                    'server': {'checkin_interval_sec': 15}, 'rotated': False}
+        link.join(handle, remote.base, 'invite', 'script', link_session=False, supports_images=enabled)
+        self.assertEqual(remote.join.call_args.args[0]['capabilities'], {'images': enabled})
+        cfg = store.read_json(store.config_path(handle))
+        self.assertEqual(cfg['supports_images'], enabled)
+        self.assertEqual(daemon.checkin_payload(handle, cfg, SELF)['capabilities'], {'images': enabled})
+    self.assertEqual(daemon.checkin_payload('legacy', {}, SELF)['capabilities'], {'images': True})
+
+  def test_binary_client_upload_and_download(self):
+    data = b'\x89PNG\r\n\x1a\n' + bytes(37)
+    path = Path(self.tmp) / 'a b.png'
+    path.write_bytes(data)
+    dest = Path(self.tmp) / 'download' / 'image.png'
+    c = client.Client('http://localhost', token='test')
+    c.opener.open = Mock(side_effect=[io.BytesIO(b'{"attachment":{"id":42}}'), io.BytesIO(data)])
+    self.assertEqual(c.upload_attachment(path), {'id': 42})
+    c.download_attachment(42, dest)
+    upload, download = (call.args[0] for call in c.opener.open.call_args_list)
+    self.assertEqual(upload.get_header('X-filename'), 'a%20b.png')
+    self.assertEqual(upload.data, data)
+    self.assertEqual(download.get_header('Authorization'), 'Bearer test')
+    self.assertEqual(download.full_url, 'http://localhost/api/v1/attachments/42')
+    self.assertEqual(dest.read_bytes(), data)
+
+  def test_send_and_reply_wire_payloads(self):
+    c = client.Client('http://localhost')
+    c.request = Mock()
+    c.send('owner', '', attachment_ids=[9, 8])
+    self.assertEqual(c.request.call_args.args[2]['attachment_ids'], [9, 8])
+    c.reply(23, 'caption', attachment_ids=[6])
+    self.assertEqual(c.request.call_args.args[1:3], ('/api/v1/messages/23/reply',
+                     {'body': 'caption', 'mode': None, 'client_msg_id': None, 'attachment_ids': [6]}))
+
+  def test_cli_repeated_images_and_reply_keys(self):
+    c = Mock()
+    c.upload_attachment.side_effect = lambda name: {'id': {'one': 1, 'two': 2}[name]}
+    with patch.object(lyra_link, '_client', return_value=c), patch.object(lyra_link, 'out'):
+      with patch('sys.stdin', io.StringIO('caption')):
+        self.assertEqual(lyra_link.main(['send', 'vision', '--to', 'owner', '--stdin',
+                                         '--image', 'two', '--image', 'one']), 0)
+      self.assertEqual(c.send.call_args.args, ('owner', 'caption'))
+      self.assertEqual(c.send.call_args.kwargs['attachment_ids'], [2, 1])
+      keys = []
+      for filename in ('one', 'two', 'two'):
+        self.assertEqual(lyra_link.main(['reply', 'vision', '--to', '7', '--image', filename]), 0)
+        self.assertEqual(c.reply.call_args.args, (7, ''))
+        keys.append(c.reply.call_args.kwargs['client_msg_id'])
+      self.assertNotEqual(keys[0], keys[1])
+      self.assertEqual(keys[1], keys[2])
+      self.assertEqual(lyra_link.main(['send', 'vision', '--to', 'owner']), 1)
+
+
 class FakeClient:
   def __init__(self, queue):
     self.queue = list(queue)
@@ -133,6 +196,30 @@ class StreamTests(Base):
     self.assertEqual(s.out[0]['source'], 'lyra')
     self.assertEqual(fake.acks, [('L1', 'delivered')])
     self.assertEqual(store.ledger_get('dario', 1)['state'], 'acked')
+
+  def test_downloads_before_handoff_and_reports_individual_errors(self):
+    message = got(7, 'L7')
+    data = b'GIF89a'
+    message['message']['attachments'] = [
+      {'id': i, 'filename': '../picture.gif', 'mime_type': 'image/gif',
+       'sha256': hashlib.sha256(data).hexdigest()} for i in (1, 2, 3)]
+    fake = FakeClient([message])
+    def download(aid, path):
+      if aid == 2:
+        raise LyraError(403, 'attachment_forbidden')
+      store.atomic_write_bytes(path, data if aid == 1 else b'bad')
+    fake.download_attachment = download
+    s = self.streamer(fake)
+    s.step()
+    first, denied, corrupt = s.out[0]['attachments']
+    dest = Path(first['local_path'])
+    self.assertEqual(dest.parent, store.attachments_dir('dario').resolve())
+    self.assertTrue(dest.is_absolute())
+    self.assertEqual(dest.read_bytes(), data)
+    self.assertIn('403', denied['download_error'])
+    self.assertIn('checksum', corrupt['download_error'])
+    self.assertNotIn('local_path', corrupt)
+    self.assertEqual(fake.acks, [('L7', 'delivered')])
 
   def test_lost_ack_is_reconciled_not_redelivered(self):
     fake = FakeClient([got(2, 'L2'), got(2, 'L2b')])

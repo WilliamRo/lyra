@@ -9,7 +9,7 @@ import logging
 import re
 import socket
 import ssl
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .accounts import COOKIE_NAME
 from .config import is_loopback
@@ -170,18 +170,36 @@ def h_conv_msgs(ctx, cid):
                                        include_all=ctx.is_admin)
 
 
+@route('POST', r'/api/v1/attachments', EITHER)
+def h_upload(ctx):
+  raw = ctx.read_bytes(ctx.settings.max_attachment_bytes, 'attachment_too_large')
+  name = unquote(ctx.h.headers.get('X-Filename', ''))
+  return {'attachment': ctx.app.upload_attachment(ctx.principal, raw, name)}
+
+
+@route('GET', r'/api/v1/attachments/(\d+)', EITHER)
+def h_image(ctx, aid):
+  row, raw = ctx.app.read_attachment(ctx.principal, int(aid), include_all=ctx.is_admin)
+  name = row['filename']
+  fallback = name.encode('ascii', 'replace').decode('ascii')
+  disposition = f'inline; filename="{fallback}"; filename*=UTF-8\'\'{quote(name)}'
+  ctx.h._headers(200, row['mime_type'], len(raw), {'Content-Disposition': disposition},
+                 cache='private, max-age=86400')
+  ctx.h.wfile.write(raw)
+
+
 @route('POST', r'/api/v1/messages', EITHER)
 def h_send(ctx):
   b = ctx.body()
   return ctx.app.send(ctx.principal, b.get('to'), b.get('body'), mode=b.get('mode'),
-                      client_msg_id=b.get('client_msg_id'))
+                      client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'))
 
 
 @route('POST', r'/api/v1/messages/(\d+)/reply', EITHER)
 def h_reply(ctx, mid):
   b = ctx.body()
   return ctx.app.reply(ctx.principal, int(mid), b.get('body'), mode=b.get('mode'),
-                       client_msg_id=b.get('client_msg_id'))
+                       client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'))
 
 
 @route('PUT', r'/api/v1/messages/(\d+)/reactions/([^/]+)', EITHER)
@@ -293,13 +311,25 @@ class Ctx:
     q = parse_qs(urlsplit(self.h.path).query)
     return {k: v[-1] for k, v in q.items()}
 
+  def read_bytes(self, limit, error_code):
+    lengths = self.h.headers.get_all('Content-Length', [])
+    if self.h.headers.get('Transfer-Encoding') or len(lengths) > 1 or (
+        lengths and not re.fullmatch(r'[0-9]{1,18}', lengths[0])):
+      self.h.close_connection = True
+      raise ApiError(400, 'bad_length', 'invalid request body length')
+    n = int(lengths[0]) if lengths else 0
+    if n > limit:
+      self.h.close_connection = True
+      raise ApiError(413, error_code, 'request body exceeds the size limit')
+    raw = self.h.rfile.read(n)
+    if len(raw) != n:
+      raise ApiError(400, 'short_body', 'incomplete request body')
+    return raw
+
   def body(self):
     if self._body is not None:
       return self._body
-    n = int(self.h.headers.get('Content-Length') or 0)
-    if n > self.settings.max_body_bytes:
-      raise ApiError(413, 'body_too_large', 'request body is too large')
-    raw = self.h.rfile.read(n) if n else b''
+    raw = self.read_bytes(self.settings.max_body_bytes, 'body_too_large')
     if not raw:
       self._body = {}
       return self._body
@@ -454,7 +484,9 @@ class Handler(BaseHTTPRequestHandler):
         if auth != PUBLIC:
           ctx.authenticate(auth, method)
         out = fn(ctx, *hit.groups())
-        return self._json(200, out, ctx.cookie_out)
+        if out is not None:
+          self._json(200, out, ctx.cookie_out)
+        return
       known = any(rx.match(path) for _m, rx, _a, _f in ROUTES)
       return self._json(405 if known else 404, {'error': 'method_not_allowed' if known else 'not_found'})
     except ApiError as exc:

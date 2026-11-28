@@ -38,11 +38,11 @@ def _resolve(handle):
   return h
 
 
-def _stdin():
-  body = sys.stdin.read()
-  if not body.strip():
-    raise RuntimeError('empty message on stdin')
-  return body
+def message_parts(args, client):
+  body = sys.stdin.read() if args.stdin else ''
+  if not body.strip() and not args.image:
+    raise ValueError('provide a message with --stdin or an image with --image PATH')
+  return body, [client.upload_attachment(path)['id'] for path in args.image]
 
 
 def _invite(value):
@@ -64,6 +64,7 @@ def main(argv=None):
   j.add_argument('--server', required=True)
   j.add_argument('--invite', required=True, help="one-time code, or '-' to read it from stdin")
   j.add_argument('--display-name')
+  j.add_argument('--no-images', action='store_true', help='advertise text-only input')
   j.add_argument('--status-file', help='statusline-shaped JSON for model, effort, usage')
   j.add_argument('--ca-bundle')
   j.add_argument('--modes', choices=('auto', 'queue'), default='auto')
@@ -75,13 +76,15 @@ def main(argv=None):
   s = sub.add_parser('send', help='start or continue a direct conversation')
   s.add_argument('handle', nargs='?')
   s.add_argument('--to', required=True)
-  s.add_argument('--stdin', action='store_true', required=True)
+  s.add_argument('--stdin', action='store_true')
+  s.add_argument('--image', action='append', default=[], metavar='PATH')
   s.add_argument('--mode', choices=('queue', 'jump'), default='queue')
 
   r = sub.add_parser('reply', help='reply to a message')
   r.add_argument('handle', nargs='?')
   r.add_argument('--to', required=True, type=int)
-  r.add_argument('--stdin', action='store_true', required=True)
+  r.add_argument('--stdin', action='store_true')
+  r.add_argument('--image', action='append', default=[], metavar='PATH')
   r.add_argument('--mode', choices=('queue', 'jump'))
 
   rc = sub.add_parser('react', help='add or remove an emoji reaction')
@@ -115,7 +118,8 @@ def main(argv=None):
       return 0  # never print: UserPromptSubmit stdout would enter the conversation
     if a.cmd == 'join':
       out(link.join(a.handle, a.server, _invite(a.invite), SCRIPT, display_name=a.display_name,
-                    status_file=a.status_file, ca_bundle=a.ca_bundle, modes=a.modes))
+                    status_file=a.status_file, ca_bundle=a.ca_bundle, modes=a.modes,
+                    supports_images=not a.no_images))
     elif a.cmd == 'link':
       out(link.link(a.handle, SCRIPT))
     elif a.cmd == 'unlink':
@@ -128,14 +132,18 @@ def main(argv=None):
       return daemon.run(a.handle)
     elif a.cmd == 'teammates':
       out(_client(_resolve(a.handle)).teammates())
-    elif a.cmd == 'send':
+    elif a.cmd in ('send', 'reply'):
       h = _resolve(a.handle)
-      out(_client(h).send(a.to, _stdin(), mode=a.mode, client_msg_id=str(uuid.uuid4())))
-    elif a.cmd == 'reply':
-      h = _resolve(a.handle)
-      body = _stdin()
-      key = hashlib.sha256(f'{h}:{a.to}:{body}'.encode()).hexdigest()[:40]  # safe retries
-      out(_client(h).reply(a.to, body, mode=a.mode, client_msg_id=key))
+      client = _client(h)
+      body, ids = message_parts(a, client)
+      if a.cmd == 'reply':
+        identity = f'{h}:{a.to}:{body}'
+        if ids:
+          identity = json.dumps([h, a.to, body, ids])
+        key = hashlib.sha256(identity.encode()).hexdigest()[:40]
+        out(client.reply(a.to, body, mode=a.mode, client_msg_id=key, attachment_ids=ids))
+      else:
+        out(client.send(a.to, body, mode=a.mode, client_msg_id=str(uuid.uuid4()), attachment_ids=ids))
     elif a.cmd == 'react':
       out(_client(_resolve(a.handle)).react(a.to, a.emoji, remove=a.remove))
     elif a.cmd == 'history':
@@ -154,7 +162,7 @@ def main(argv=None):
   except LyraError as exc:
     out({'error': exc.code, 'status': exc.status, 'message': exc.message, **exc.body})
     return 1
-  except (RuntimeError, ValueError) as exc:
+  except (RuntimeError, ValueError, OSError) as exc:
     out({'error': 'local', 'message': str(exc)})
     return 1
 

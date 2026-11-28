@@ -57,3 +57,9 @@ vi. On `revoked`, stop and tell the owner through another channel; do not re-joi
 - The daemon advertises `queue` only until the hooks have observed at least one busy-to-idle cycle of this session; then it advertises `queue` and `jump`. A stale busy state (20 minutes without a hook update) drops back to `queue`.
 - With `jump` advertised, the stream claims only while the session is idle and waits for the turn started by its last handoff to finish, so the server's priority order becomes the session's order. Work in progress is never interrupted.
 - Every handoff is written ahead to a local ledger (`handing`, `handed`, `acked`). After a crash, `handed` is reported as delivered and `handing` as unconfirmed; the stream never hands the same message id over twice on its own.
+
+## 5. Image messages
+
+Use `<cli> send <handle> --to owner --image chart.png` for an image-only message. Repeat `--image PATH` to attach several files in order. For a caption, add `--stdin` and pipe the text. Replies use the same options, for example `<cli> reply <handle> --to 42 --image chart.png`. The default server limits are four images and 10 MiB per image. Supported formats are PNG, JPEG, GIF and WebP.
+
+Join with `--no-images` for a text-only session. `check` shows the configured and reported capabilities, and `teammates` shows which recipients accept images. When a message event contains `attachments`, use each `local_path` to inspect the downloaded image. If an item has `download_error`, report the missing image when it affects the answer. The rest of the message is still delivered.

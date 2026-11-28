@@ -8,6 +8,7 @@ import time
 
 from . import __version__
 from .accounts import AccountsMixin
+from .attachments import AttachmentMixin
 from .db import Database
 from .events import EventLog
 from .messaging import MessagingMixin
@@ -18,7 +19,7 @@ from .security import LoginThrottle
 log = logging.getLogger('lyra')
 
 
-class Lyra(AccountsMixin, RegistryMixin, MessagingMixin):
+class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin):
   """All business rules; the HTTP layer only authenticates and translates."""
 
   def __init__(self, settings, clock=time.time):
@@ -40,6 +41,7 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin):
       expired, _lapsed = self.sweep_messages(c, now)
       self.events.prune(c, now - self.settings.event_retention_days * 86400)
       self.prune_sessions(c, now)
+      self.sweep_orphan_attachments(c, now)
     if went_offline or expired:
       self.events.notify()
     # i. Lapsed leases become claimable again; wake long-pollers to retry.
@@ -96,7 +98,9 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin):
       'pools': [{'id': r['id'], 'provider': r['provider'], 'label': r['label'],
                  'reporter_principal_id': r['reporter_principal_id']}
                 for r in self.db.all('SELECT * FROM pools ORDER BY provider, label')],
-      'settings': {'checkin_ttl_sec': self.settings.checkin_ttl_sec,
+      'settings': {'max_attachment_bytes': self.settings.max_attachment_bytes,
+                   'max_attachments_per_message': self.settings.max_attachments_per_message,
+                   'checkin_ttl_sec': self.settings.checkin_ttl_sec,
                    'message_ttl_sec': self.settings.message_ttl_sec,
                    'invite_ttl_sec': self.settings.invite_ttl_sec},
       'last_event_id': self.events.latest_id(),

@@ -7,7 +7,6 @@ import ipaddress
 import os
 from pathlib import Path
 import sys
-import tomllib
 from urllib.parse import urlsplit
 
 
@@ -101,6 +100,9 @@ class Settings:
   remember_me_days: int = 30
   session_idle_hours: int = 12
   max_body_bytes: int = 65536
+  max_attachment_bytes: int = 10 * 1024 * 1024
+  max_attachments_per_message: int = 4
+  orphan_attachment_ttl_sec: int = 3600
   max_message_chars: int = 16000
   event_retention_days: int = 30
   agent_rate_per_hour: int = 20
@@ -118,6 +120,10 @@ class Settings:
   @property
   def db_path(self):
     return self.data_path / 'lyra.sqlite'
+
+  @property
+  def attachments_path(self):
+    return self.data_path / 'attachments'
 
   @property
   def tls(self):
@@ -163,6 +169,10 @@ def load(env=None, config_path=None):
   names = {f.name for f in fields(Settings) if f.name != 'extra'}
   path = config_path or env.get('LYRA_CONFIG')
   if path:
+    try:
+      import tomllib
+    except ModuleNotFoundError:
+      raise ConfigError('TOML configuration requires Python 3.11+. Use LYRA_* environment settings on earlier versions.') from None
     with open(path, 'rb') as fh:
       data = tomllib.load(fh)
     for k, v in data.items():

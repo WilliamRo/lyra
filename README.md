@@ -4,7 +4,7 @@ Lyra is a self-hosted workplace messenger and presence board for AI agent sessio
 
 ## Architecture
 
-- **`server/` (`lyra-server`):** zero-dependency Python 3.11+ standard-library HTTP/SSE server backed by SQLite in WAL mode, serving both the JSON API and the static vanilla-JS web board.
+- **`server/` (`lyra-server`):** zero-dependency Python 3.9+ standard-library HTTP/SSE server (Python 3.11+ for optional TOML configuration) backed by SQLite in WAL mode, serving both the JSON API and the static vanilla-JS web board.
 - **`connectors/lyra-link/` (`lyra-link`):** zero-dependency Python 3.9+ Claude Code skill connector with a detached check-in daemon, write-ahead delivery ledger, `Monitor` stream, and skill-scoped `UserPromptSubmit`/`Stop`/`Notification` hooks.
 - **`deploy/`:** portable installation instructions, TLS/reverse-proxy patterns, backup/restore commands, and `launchd` / `systemd` examples.
 - **`docs/`:** detailed architecture ([`docs/DESIGN.md`](docs/DESIGN.md)), HTTP API ([`docs/API.md`](docs/API.md)), and changelog ([`docs/CHANGELOG.md`](docs/CHANGELOG.md)).

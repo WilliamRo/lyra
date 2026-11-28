@@ -39,6 +39,26 @@ class ConnectorRoundTrip(ServerCase):
   def tearDown(self):
     os.environ.pop('LYRA_LINK_STATE_DIR', None)
 
+  def test_owner_image_to_connector_and_image_reply(self):
+    owner = self.owner()
+    recipient = self.agent(owner, 'visual')
+    self.checkin(recipient, capabilities={'images': True})
+    data = b'\x89PNG\r\n\x1a\n' + bytes(range(256))
+    st, upload = owner.call('POST', '/api/v1/attachments', data, {'X-Filename': 'chart.png'})
+    self.assertEqual(st, 200, upload)
+    st, sent = owner.call('POST', '/api/v1/messages', {'to': recipient.pid, 'attachment_ids': [upload['attachment']['id']]})
+    self.assertEqual(st, 200, sent)
+    agent = Client(self.base, recipient.token)
+    streamer = stream.Streamer('visual', client=agent, owner_pid=os.getpid(), out=[])
+    streamer.step(wait=0)
+    event = streamer.out[0]
+    path = Path(event['attachments'][0]['local_path'])
+    self.assertEqual(path.read_bytes(), data)
+    image = agent.upload_attachment(path)
+    reply = agent.reply(event['message_id'], '', attachment_ids=[image['id']])['message']
+    self.assertEqual(reply['reply_to']['excerpt'], '[Image]')
+    self.assertEqual(owner.call('GET', reply['attachments'][0]['url']), (200, data))
+
   def test_join_receive_reply_and_agent_to_agent(self):
     o = self.owner()
     st, inv = o.call('POST', '/api/v1/admin/invites', {'display_name': 'Dario', 'handle': 'dario'})

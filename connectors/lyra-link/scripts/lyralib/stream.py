@@ -4,6 +4,7 @@
 #   lost acknowledgement never becomes a silent duplicate.
 # =============================================================================
 
+import hashlib
 import json
 import os
 import threading
@@ -35,6 +36,7 @@ def event_for(handle, got):
     'conversation_kind': m['conversation_kind'],
     'from': {'handle': m['sender']['handle'], 'display_name': m['sender']['display_name'],
              'kind': m['sender']['kind']},
+    'attachments': m.get('attachments', []),
     'text': m['body'], 'mode': m['mode'], 'attempt': got.get('attempt'), 'retry': m['retry'],
     'reply_to': m['reply_to'], 'created_at': m['created_at'],
     'reply_with': f'lyra_link.py reply {handle} --to {m["id"]} --stdin',
@@ -142,6 +144,18 @@ class Streamer:
       except LyraError:
         pass
       return
+    for attachment in m.get('attachments', []):
+      try:
+        ext = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
+               'image/webp': 'webp'}[attachment['mime_type']]
+        path = store.attachments_dir(self.handle) / f"{int(attachment['id'])}.{ext}"
+        self.client.download_attachment(attachment['id'], path)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != attachment['sha256']:
+          path.unlink(missing_ok=True)
+          raise ValueError('image checksum mismatch')
+        attachment['local_path'] = str(path.resolve())
+      except (OSError, LyraError, ValueError, TypeError, KeyError) as exc:
+        attachment['download_error'] = str(exc)
     store.ledger_set(self.handle, mid, state='handing', lease_id=got['lease_id'])
     emit(event_for(self.handle, got), self.out)
     store.ledger_set(self.handle, mid, state='handed', lease_id=got['lease_id'])

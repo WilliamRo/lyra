@@ -34,12 +34,22 @@ def hdir(handle):
 
 
 def atomic_write(path, text, mode=0o600):
+  atomic_write_bytes(path, text.encode('utf-8'), mode)
+
+
+def attachments_dir(handle):
+  p = hdir(handle) / 'attachments'
+  p.mkdir(mode=0o700, exist_ok=True)
+  return p
+
+
+def atomic_write_bytes(path, data, mode=0o600):
   path = Path(path)
   path.parent.mkdir(parents=True, exist_ok=True)
   fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix='.tmp-')
   try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
-      fh.write(text)
+    with os.fdopen(fd, 'wb') as fh:
+      fh.write(data)
       fh.flush()
       os.fsync(fh.fileno())
     os.chmod(tmp, mode)

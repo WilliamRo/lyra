@@ -25,7 +25,7 @@ def monitor_command(handle, script):
 
 
 def join(handle, server, invite, script, display_name=None, status_file=None, ca_bundle=None,
-         modes='auto', provider='anthropic', runtime='claude-code', link_session=True):
+         modes='auto', provider='anthropic', runtime='claude-code', link_session=True, supports_images=True):
   """Redeem a one-time invite from inside a running session (no restart)."""
   owner = _owner_or_raise() if link_session else None
   if owner:
@@ -45,7 +45,7 @@ def join(handle, server, invite, script, display_name=None, status_file=None, ca
     'invite_code': invite, 'client_key': pend['client_key'], 'handle': handle,
     'display_name': display_name, 'host': host, 'provider': provider, 'runtime': runtime,
     'connector': 'lyra-link', 'address': f'{runtime}://{host}/{handle}',
-    'modes': ['queue'],
+    'modes': ['queue'], 'capabilities': {'images': supports_images},
   }
   res = client.join(payload)
   got = res['principal']['handle']
@@ -53,6 +53,7 @@ def join(handle, server, invite, script, display_name=None, status_file=None, ca
                                            'joined_at': time.time()})
   store.write_json(store.config_path(got), {
     'server_url': client.base, 'ca_bundle': ca_bundle, 'status_file': status_file,
+    'supports_images': supports_images,
     'modes': modes, 'provider': provider, 'runtime': runtime,
     'checkin_interval_sec': res['server']['checkin_interval_sec'],
   })
@@ -113,6 +114,7 @@ def check(handle=None):
   alive, drec = daemon.daemon_alive(handle)
   out.update({
     'server_url': cfg.get('server_url'), 'modes_setting': cfg.get('modes'),
+    'capabilities': {'images': bool(cfg.get('supports_images', True))},
     'status_file': cfg.get('status_file'), 'link': rec.get('status'),
     'linked_pid': rec.get('claude_pid'), 'daemon_alive': alive, 'daemon_pid': drec.get('pid'),
     'stream_attached_age': store.stamp_age(store.attached_path(handle)),
@@ -127,7 +129,8 @@ def check(handle=None):
     client, _cfg, _ = daemon.client_for(handle)
     me = client.me()
     out['server_view'] = {'principal': me['principal'], 'online': me['presence']['online'],
-                          'modes': me['presence']['modes']}
+                          'modes': me['presence']['modes'],
+                          'capabilities': me['presence'].get('capabilities', {'images': False})}
   except (LyraError, RuntimeError, KeyError) as e:
     out['server_error'] = str(e)
   return out
