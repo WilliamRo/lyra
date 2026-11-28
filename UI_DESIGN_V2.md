@@ -349,7 +349,12 @@ The modules still degrade safely: without KaTeX, math shows as TeX source; witho
   - **Browser tests** (`tests/js/test_dom.js`, 13 cases, plus the engine cases in the page): set `LYRA_BROWSER_TESTS=1` with Chrome or Chromium installed. Pages are served with the live Lyra CSP header; `tests/js/csp_probe.html` checks KaTeX against each blocked vector. Covers XSS payloads (QA-02), KaTeX and currency (QA-20), wide tables on 390 px (QA-18), the dialog size, wheel anchoring, drag clamping, double-click, keyboard, pinch and double-tap (QA-06, QA-07), focus return, avatars (QA-12), lifecycle (QA-21, QA-22) and persistent drafts (QA-11).
 - `server/tests/test_board_e2e.py` (opt-in with `LYRA_BROWSER_TESTS=1`) runs the wired board end to end. It seeds a real server through the public API (`tests/js/qa_board.py`: hosts with telemetry and an alias, pools with usage and a long duplicated label, Consul, PNG avatars, needs-input, stalled, held and offline agents, every message state including cancelled, an image, pins, a team thread, an orphaned upload, projects with all six task states and a blocked reason) and puts a test-only sign-in proxy in front, which can drop SSE streams. It then drives Chrome over the DevTools pipe (`tests/js/cdp.py`) at 1440 x 900 and at 390 x 844 (touch, DPR 2):
   - `tests/js/qa/probe.js` runs 49 desktop and 8 phone feature checks with DOM events only, in light and in dark. It also fails on any element that crosses its rail, card or row container. Proxy hooks inject failures, stalls and cursor resets, let seeded agents claim or post messages, and log request timing.
-  - Four more tests cover the load order (board, then conversations, then events), the sidebar clamp with the Projects split at 1100 and 1300 px, a failed first snapshot that retries and restores the open thread, and a reconnect that never answers until the watchdog cuts it.
+  - Five more tests cover:
+    - the load order (board, then conversations, then events);
+    - the sidebar clamp with the Projects split at 1100 and 1300 px;
+    - a failed first snapshot that retries and restores the open thread;
+    - a reconnect that never answers until the watchdog cuts it;
+    - late snapshots that must never overwrite newer state.
   - Any page error, console error or CSP violation fails the test.
   - `tests/js/qa_shots.py` captures light and dark screenshots; set `LYRA_QA_SHOTS=<dir>` to keep them.
 - `tests/js/gallery.html` and `tests/js/phone.html` remain the module-level visual QA pages; they are not served by Lyra.
@@ -416,6 +421,13 @@ Wired against `upstream/main` dcebc90 (`docs/API.md` section 6.4); `server/lyra_
 - **Task dialog:** saves and conflicts belong to the dialog generation that sent them, so a late answer for task A never closes or rewrites the dialog of task B.
 - **Sign-out:** a 401 shows the sign-in card, aborts every request of the ended session, cancels pending refreshes and resync timers, and schedules no further retries.
 - **Text-only agents:** tapping the disabled attach control focuses it and also writes "Text only: this agent does not accept images" under the composer, for touch screens without hover.
+
+### 12.8 Review round 3 (snapshot ordering)
+
+- **Versioned snapshots:** the board, the conversation list and the open transcript are versioned. Every read takes a sequence number when it starts and commits only if no newer read of the same resource has committed. Transcript reads are also tied to the navigation token, which changes whenever another conversation opens. All paths load through the same versioned loaders: `refreshAll`, event refreshes, `reloadConv`, send, and task conflicts. So an older response that resolves late is dropped instead of overwriting newer state.
+- **Events during a resync:** while a resync is pending, SSE invalidations are kept rather than scheduled. After the full reload, they are applied in a loop until none are left. Only then does the resync end, the badge switch from `syncing` to `live`, and the cursor advance. A restored first snapshot clears its initial flag before that loop.
+- **Send:** a failed list refresh after an accepted send no longer marks the message "Not sent".
+- **Test:** `test_late_reconnect_snapshot_never_overwrites_newer_state` holds a response body after the server produced it, delivers a real new message over the live stream, then releases the old body last. It covers the open transcript and the conversation-list excerpt, during a reconnect resync and in plain event refreshes. Chrome waits on a cache lock while response headers are pending, so the proxy sends the headers immediately and holds only the body.
 
 ## 13. Survey Notes and References
 

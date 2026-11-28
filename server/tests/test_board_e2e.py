@@ -18,6 +18,8 @@
 #   - Round 2: pending uploads across A -> B -> A, one refresh batch with board and
 #     conversation events, a failed first snapshot, the reset cursor and transcript
 #     retries, a hung reconnect (watchdog), task dialog generations, 401 sign-out
+#   - Round 3: a late reconnect snapshot released after a newer message never
+#     overwrites the transcript or the conversation list
 #   - zero page errors, console errors or CSP violations (except failures the
 #     probe injected on purpose), and no element that crosses its container
 #   - visual QA screenshots in light and dark (kept when LYRA_QA_SHOTS=<dir>)
@@ -154,6 +156,64 @@ class WiredBoardTests(unittest.TestCase):
       self.assertGreater(waited, 25, 'reconnected without waiting out the hung connect')
       connects = [e for e in self.proxy.qa.log if e['path'] == '/api/v1/events']
       self.assertGreaterEqual(len(connects), 3)          # first stream, the hung one, the recovery
+    finally:
+      chrome.close()
+
+  def test_late_reconnect_snapshot_never_overwrites_newer_state(self):
+    # A reconnect reload reads the transcript (then, in a second round, the conversation list)
+    # before a new message arrives; its response is held until after that message came over the
+    # live stream. Released last, the old snapshot must not erase the new message from either view.
+    chrome = Chrome().open_page(1440, 900)
+    js = json.dumps
+    try:
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.querySelectorAll('.conv-row').length >= 5", timeout=20)
+      row = "[...document.querySelectorAll('.conv-row')].find((r) => r.querySelector('.conv-title span').textContent === 'Dario')"
+      chrome.eval(f"{row}.querySelector('.conv-main').click()")
+      chrome.wait_for("document.getElementById('conv-header').textContent.includes('Dario')"
+                      " && document.querySelectorAll('#messages .msg').length > 0")
+      calm = ("document.getElementById('live').classList.contains('on') && document.getElementById('conn-banner').hidden")
+      chrome.wait_for(calm, timeout=15)
+      conv_id = chrome.eval(f"{row}.dataset.convId")
+      for path, text in ((f'/api/v1/conversations/{conv_id}/messages', 'Fresh transcript message'),
+                         ('/api/v1/conversations', 'Fresh list message')):
+        with self.subTest(held=path):
+          release = self.proxy.qa.hold_next(path)
+          start = len(self.proxy.qa.log)
+          chrome.eval("fetch('/__qa/drop-sse').then(() => true)")
+          deadline = time.monotonic() + 15
+          while not any(e.get('held') and e['path'] == path for e in self.proxy.qa.log[start:]):
+            self.assertLess(time.monotonic(), deadline, 'the reconnect never read ' + path)
+            time.sleep(0.05)
+          self.board.agents['dario'].call('POST', '/api/v1/messages', {'to': 'owner', 'body': text})
+          time.sleep(1.5)                 # the event-driven refresh would render it by now
+          release.set()                   # the older reconnect response lands last
+          shown = (f"document.getElementById('messages').textContent.includes({js(text)})"
+                   f" && {row}.querySelector('.conv-excerpt').textContent.includes({js(text)})")
+          chrome.wait_for(f"{calm} && {shown}", timeout=15)
+          streams = len([e for e in self.proxy.qa.log if e['path'] == '/api/v1/events'])
+          time.sleep(2)                   # quiet: no further event would repair a stale view
+          self.assertTrue(chrome.eval(f"{calm} && {shown}"), 'the new message disappeared again')
+          self.assertEqual(streams, len([e for e in self.proxy.qa.log if e['path'] == '/api/v1/events']))
+      # Without a resync: an event-driven transcript read is held while a second message triggers
+      # a newer refresh; the older read, released last, must be dropped by the snapshot version.
+      with self.subTest(held='event-driven transcript'):
+        path = f'/api/v1/conversations/{conv_id}/messages'
+        release = self.proxy.qa.hold_next(path)
+        start = len(self.proxy.qa.log)
+        self.board.agents['dario'].call('POST', '/api/v1/messages', {'to': 'owner', 'body': 'First of two'})
+        deadline = time.monotonic() + 15
+        while not any(e.get('held') and e['path'] == path for e in self.proxy.qa.log[start:]):
+          self.assertLess(time.monotonic(), deadline, 'no event-driven read of ' + path)
+          time.sleep(0.05)
+        self.board.agents['dario'].call('POST', '/api/v1/messages', {'to': 'owner', 'body': 'Second of two'})
+        newer = (f"document.getElementById('messages').textContent.includes('Second of two')"
+                 f" && {row}.querySelector('.conv-excerpt').textContent.includes('Second of two')")
+        chrome.wait_for(newer, timeout=10)
+        release.set()
+        time.sleep(2)
+        self.assertTrue(chrome.eval(f"{calm} && {newer}"), 'the older event-driven read overwrote the transcript')
+      self.assertEqual(chrome.console_problems(), [])
     finally:
       chrome.close()
 

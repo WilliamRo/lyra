@@ -41,7 +41,10 @@ const S = {
   pending: { board: false, convs: false, conv: false, timer: null }, receiptNodes: new Map(),
   qs: { items: [], all: [], sel: 0 }, needs: [], needsKeys: null, failed: new Map(), notifyConvs: new Set(),
   audio: null, menuHost: null, seenEventId: null, session: new AbortController(), pendingUploads: new Map(),
-  resync: { pending: false, inflight: false, again: false, attempt: 0, timer: null, latest: null },
+  resync: { pending: false, inflight: false, again: false, attempt: 0, timer: null, latest: null, dirty: null },
+  // Snapshot versions: a read takes a number when it starts and commits only if no newer read of
+  // the same resource has committed, so a late, older response can never overwrite newer state.
+  snap: { board: { started: 0, committed: 0 }, convs: { started: 0, committed: 0 }, msgs: { started: 0, committed: 0 } },
 };
 
 // =============================================================================
@@ -247,7 +250,7 @@ function showLogin() {
   stopEvents();
   const r = S.resync;
   clearTimeout(r.timer);
-  r.pending = false; r.inflight = false; r.again = false; r.attempt = 0; r.initial = false;
+  r.pending = false; r.inflight = false; r.again = false; r.attempt = 0; r.initial = false; r.dirty = null;
   clearTimeout(S.pending.timer);
   S.pending.board = S.pending.convs = S.pending.conv = false;
   S.session.abort();
@@ -450,14 +453,34 @@ $('sidebar-toggle').addEventListener('click', toggleSidebar);
 // Loading and live refresh
 // =============================================================================
 
+// Versioned snapshot loaders: every path (refreshAll, runRefresh, reloadConv, send, task conflicts)
+// commits through these, so the newest started read always wins. They return true when committed.
+async function loadBoard() {
+  const v = S.snap.board;
+  const seq = ++v.started;
+  const board = await api('GET', '/api/v1/board');
+  if (seq <= v.committed) return false;
+  v.committed = seq;
+  S.board = board;
+  if (S.lastEventId == null && board.last_event_id != null) S.lastEventId = String(board.last_event_id);
+  return true;
+}
+
+async function loadConvs() {
+  const v = S.snap.convs;
+  const seq = ++v.started;
+  const r = await api('GET', '/api/v1/conversations');
+  if (seq <= v.committed) return false;
+  v.committed = seq;
+  S.convs = r.conversations || [];
+  return true;
+}
+
 async function refreshAll(initial) {
   // Board first: its last_event_id is the SSE cursor, so everything after it replays on connect.
   // Conversations are read after that cursor, never before it, so no message can slip between them.
-  const board = await api('GET', '/api/v1/board');
-  const convs = await api('GET', '/api/v1/conversations');
-  S.board = board;
-  S.convs = convs.conversations || [];
-  if (S.lastEventId == null && board.last_event_id != null) S.lastEventId = String(board.last_event_id);
+  await loadBoard();
+  await loadConvs();
   if (initial || !S.view) { loadView(); applyTheme(); applySidebar(); renderNotifyToggle(); }
   renderTabs();
   renderAgents();
@@ -491,20 +514,32 @@ async function runRefresh() {
   const p = S.pending;
   const want = { board: p.board, convs: p.convs, conv: p.conv };
   p.board = p.convs = p.conv = false;
-  try {
-    const [board, convs] = await Promise.all([
-      want.board ? api('GET', '/api/v1/board') : null,
-      want.convs ? api('GET', '/api/v1/conversations') : null]);
-    // Both snapshots first, then every view: agent rows read conversation unread counts.
-    if (board) S.board = board;
-    if (convs) S.convs = convs.conversations || [];
-    if (board) { renderProjects(); renderSenate(); }
-    if (convs) { renderConvList(); notifyNewMessages(); }
-    if (S.board && (board || convs)) renderAgents();
-    if (board || convs) renderTitle();
-    if ((want.conv || board) && S.conv && S.conv.id) await reloadConv();
-    else if (board && S.conv) { renderThreadHeader(); renderComposer(); }
-  } catch (_e) { /* the next event or reconnect retries */ }
+  try { await refreshWanted(want, false); } catch (_e) { /* the next event or reconnect retries */ }
+}
+
+// Refresh what events invalidated. Both snapshots commit before any view repaints (agent rows read
+// conversation unread counts). propagate: rethrow failures (a resync retries them).
+async function refreshWanted(want, propagate) {
+  const [gotBoard, gotConvs] = await Promise.all([want.board ? loadBoard() : false, want.convs ? loadConvs() : false]);
+  if (gotBoard) { renderProjects(); renderSenate(); }
+  if (gotConvs) { renderConvList(); notifyNewMessages(); }
+  if (S.board && (gotBoard || gotConvs)) renderAgents();
+  if (gotBoard || gotConvs) renderTitle();
+  if ((want.conv || want.board) && S.conv && S.conv.id) await reloadConv({ propagate });
+  else if (gotBoard && S.conv) { renderThreadHeader(); renderComposer(); }
+}
+
+// SSE invalidations: during a resync they are kept and applied before the board is declared current.
+function invalidate(flags) {
+  const r = S.resync;
+  if (r.pending) {
+    const d = r.dirty || (r.dirty = { board: false, convs: false, conv: false });
+    d.board = d.board || !!flags.board;
+    d.convs = d.convs || !!flags.convs;
+    d.conv = d.conv || !!flags.conv;
+    return;
+  }
+  schedule(flags);
 }
 
 // --- SSE: cursor seeded from /board, reset reloads, tick watchdog, reconnect banner --------
@@ -567,12 +602,22 @@ async function startResync(latest, opts) {
   r.inflight = true;
   const session = S.session;
   try {
+    r.dirty = null;                         // the full reload below covers everything seen so far
     await refreshAll(r.initial);
     if (session !== S.session) return;      // signed out meanwhile
+    r.initial = false;                      // the view is restored; later loops are plain reloads
+    // Events that arrived during the reload: apply them (and any that arrive meanwhile) before the
+    // board counts as current. Only then does the cursor move and the badge read "live".
+    while (r.dirty && !r.again) {
+      const flags = Object.assign({}, r.dirty);
+      r.dirty = null;
+      if (S.conv && S.conv.id != null) flags.conv = true;
+      await refreshWanted(flags, true);
+      if (session !== S.session) return;
+    }
     r.inflight = false;
     if (r.again) { r.again = false; startResync(null); return; }
     r.pending = false;
-    r.initial = false;
     r.attempt = 0;
     S.lastEventId = S.seenEventId || r.latest || S.lastEventId;
     setConn(S.conn.up);
@@ -623,15 +668,15 @@ function onEvent(type, ev) {
   switch (type) {
     case 'message':
       if (d.state === 'delivered') S.notifyConvs.add(d.conversation_id);   // a message to the owner
-      schedule({ convs: true, conv: inConv, board: true });
+      invalidate({ convs: true, conv: inConv, board: true });
       break;
     case 'message_state':
       if (d.state === 'failed') noteFailed(d.conversation_id);
-      schedule({ conv: inConv, board: true });
+      invalidate({ conv: inConv, board: true });
       break;
-    case 'message_progress': schedule({ conv: inConv, board: true }); break;
-    case 'conversation': schedule({ convs: true }); break;
-    default: schedule({ board: true });
+    case 'message_progress': invalidate({ conv: inConv, board: true }); break;
+    case 'conversation': invalidate({ convs: true }); break;
+    default: invalidate({ board: true });
   }
 }
 
@@ -1528,9 +1573,13 @@ async function reloadConv(opts) {
   if (!S.conv || S.conv.id == null) return;
   const navigation = S.navigation;
   const id = S.conv.id;
+  const v = S.snap.msgs;
+  const seq = ++v.started;
   try {
     const r = await api('GET', `/api/v1/conversations/${id}/messages?limit=300`);
-    if (navigation !== S.navigation) return;
+    // Another conversation is open now, or a newer read of this transcript already committed.
+    if (navigation !== S.navigation || seq <= v.committed) return;
+    v.committed = seq;
     const meta = S.convs.find((c) => c.id === id) || {};
     S.conv.kind = r.kind;
     S.conv.read_only = r.read_only;
@@ -2160,9 +2209,8 @@ async function sendEntry(entry) {
       S.replyTo = null;
     }
     S.sending = false;
-    const convs = await api('GET', '/api/v1/conversations');
-    S.convs = convs.conversations || [];
-    renderConvList();
+    // The message is accepted; a failed list refresh must not turn it into "Not sent".
+    try { if (await loadConvs()) renderConvList(); } catch (_e) { schedule({ convs: true }); }
     if (sameConv && S.conv.id == null) {
       S.conv.id = r.message.conversation_id;
       S.conv.pendingTo = null;
@@ -2480,14 +2528,12 @@ $('task-dialog').addEventListener('close', () => { taskDialogSeq += 1; });
 // is then a deliberate overwrite of exactly that version.
 async function showTaskConflict(seq) {
   $('tf-error').textContent = '';
-  let board;
-  try { board = await api('GET', '/api/v1/board'); }
-  catch (e) {
+  try {
+    if (await loadBoard()) { renderAgents(); renderProjects(); renderSenate(); }   // else a newer board is already in
+  } catch (e) {
     if (seq === taskDialogSeq) $('tf-error').textContent = `This task changed elsewhere and the latest version could not be loaded: ${e.message}`;
     return;
   }
-  S.board = board;
-  renderAgents(); renderProjects(); renderSenate();
   if (seq !== taskDialogSeq) return;          // the owner moved on to another task meanwhile
   const latest = editingTask && findTask(editingTask.id);
   if (!latest) { $('tf-error').textContent = 'This task no longer exists.'; return; }

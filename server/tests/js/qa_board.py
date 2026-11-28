@@ -312,9 +312,17 @@ class QAState:
     self.lock = threading.Lock()
     self.fail = []          # [{'path', 'status', 'count'}]
     self.stall = []         # [{'path', 'ms', 'count'}]
+    self.hold = []          # [{'path', 'count', 'event'}]: forward now, send headers, deliver the body on release
     self.reset_next = False
     self.log = []           # [{'method', 'path', 'start', 'end', 'status'}]
     self.expected = set()   # paths with injected failures or stalls (their console noise is expected)
+
+  def hold_next(self, path, timeout=30):
+    """Hold the next response body for `path` after the server produced it; set the event to release."""
+    ev = threading.Event()
+    with self.lock:
+      self.hold.append({'path': path, 'count': 1, 'event': ev, 'timeout': timeout})
+    return ev
 
   def take(self, rules, path):
     with self.lock:
@@ -445,6 +453,14 @@ class _ProxyHandler(BaseHTTPRequestHandler):
       headers['Origin'] = board.base
     path = u.path + ('?' + query if query and not query.startswith('qa=') else '')
     try:
+      self._relay(conn, u, path, body, headers, entry)
+    finally:
+      conn.close()                        # on every exit, including a browser that hung up mid-write
+      if entry['end'] is None:
+        entry['end'] = time.monotonic()
+
+  def _relay(self, conn, u, path, body, headers, entry):
+    try:
       conn.request(self.command, path, body=body, headers=headers)
       resp = conn.getresponse()
     except OSError:                       # the seeded server already stopped (test teardown)
@@ -457,6 +473,7 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     entry['status'] = resp.status
     is_sse = (resp.getheader('Content-Type') or '').startswith('text/event-stream')
     payload = None if is_sse else resp.read()
+    holding = None if is_sse else self.qa.take(self.qa.hold, u.path)
     if u.path == '/' and 'qa=probe' in (u.query or '') and payload:
       payload = payload.replace(b'</head>', b'<script src="/__qa/probe.js" defer></script>\n</head>')
     self.send_response(resp.status)
@@ -483,14 +500,18 @@ class _ProxyHandler(BaseHTTPRequestHandler):
       finally:
         with self.sse_lock:
           self.sse.discard(self.connection)
-        conn.close()
-        entry['end'] = time.monotonic()
       return
     self.send_header('Content-Length', str(len(payload)))
     self.end_headers()
+    if holding:
+      # The server already answered and the browser has the headers; the body waits for the
+      # release, so this response resolves after any newer request for the same resource.
+      self.wfile.flush()
+      entry['held'] = True
+      holding['event'].wait(holding['timeout'])
+      entry['held'] = False
     self.wfile.write(payload)
-    conn.close()
-    entry['end'] = time.monotonic()
+
 
   do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _forward
 
