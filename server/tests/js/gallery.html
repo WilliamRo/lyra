@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Lyra v2 module gallery</title>
+<link rel="stylesheet" href="/lyra_server/static/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/lyra_server/static/markdown.css">
+<link rel="stylesheet" href="/lyra_server/static/imgpop.css">
+<link rel="stylesheet" href="/lyra_server/static/avatar.css">
+<link rel="stylesheet" href="/lyra_server/static/lifecycle.css">
+<link rel="stylesheet" href="gallery.css">
+<script src="/lyra_server/static/vendor/katex/katex.min.js" defer></script>
+<script src="/lyra_server/static/markdown.js" defer></script>
+<script src="/lyra_server/static/imgpop.js" defer></script>
+<script src="/lyra_server/static/avatar.js" defer></script>
+<script src="/lyra_server/static/lifecycle.js" defer></script>
+<script src="gallery.js" defer></script>
+</head>
+<body>
+<div class="g-shell">
+  <h1 class="g-title">Lyra</h1>
+  <p class="g-sub">Visual QA for the v2 modules: Markdown, KaTeX, lifecycle, avatars, image viewer.</p>
+  <div class="g-grid">
+    <section class="g-pane"><h2>Conversation</h2><div id="thread" class="g-thread"></div></section>
+    <section class="g-pane"><h2>Delivery states</h2><div id="states"></div>
+      <h2 class="g-gap">Avatars</h2><div id="avatars" class="g-row"></div></section>
+  </div>
+</div>
+</body>
+</html>

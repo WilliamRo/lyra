@@ -1,0 +1,18 @@
+/* Lyra avatar.css: circles for avatar.js. */
+
+.avatar { position: relative; flex: none; display: inline-grid; place-items: center; border-radius: 50%;
+  font-weight: 700; line-height: 1; user-select: none; -webkit-user-select: none; letter-spacing: .01em; }
+.avatar-xs { width: 24px; height: 24px; font-size: 10px; }
+.avatar-sm { width: 28px; height: 28px; font-size: 11px; }
+.avatar-md { width: 32px; height: 32px; font-size: 12.5px; }
+.avatar-lg { width: 44px; height: 44px; font-size: 16px; }
+.avatar.is-consul { box-shadow: 0 0 0 2px var(--card, #fff), 0 0 0 4px var(--consul-gold, #c98a12); }
+
+.avatar-status { position: absolute; right: -1px; bottom: -1px; width: 10px; height: 10px; border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--card, #fff); background: var(--muted, #8a93a6); }
+.avatar-status.is-on { background: var(--ok, #1f8a4c); }
+.avatar-xs .avatar-status { width: 8px; height: 8px; }
+
+.avatar-stack { display: inline-flex; flex: none; }
+.avatar-stack .avatar { box-shadow: 0 0 0 2px var(--card, #fff); }
+.avatar-stack .avatar + .avatar { margin-left: -8px; }
