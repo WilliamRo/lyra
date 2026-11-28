@@ -459,15 +459,34 @@ class RegistryMixin:
   def presence_view(self, pid):
     r = self.db.one('SELECT * FROM presence WHERE principal_id=?', (pid,))
     if not r:
-      return {'online': False, 'last_checkin_at': None, 'modes': ['queue'], 'status': {},
-              'capabilities': clean_capabilities(None), 'host_metrics': {}}
-    online = bool(r['online'] and r['last_checkin_at'] is not None and self.now() - r['last_checkin_at']
+      return {'online': False, 'effective_status': 'offline', 'last_checkin_at': None,
+              'modes': ['queue'], 'status': {}, 'capabilities': clean_capabilities(None),
+              'host_metrics': {}}
+    now = self.now()
+    online = bool(r['online'] and r['last_checkin_at'] is not None and now - r['last_checkin_at']
                   <= self.settings.checkin_ttl_sec)
+    status = loads(r['status'], {})
+    effective_status = 'offline'
+    if online:
+      active = self.db.one("""
+        SELECT mp.updated_at FROM message_progress mp
+        JOIN messages m ON m.id = mp.message_id
+        WHERE m.recipient_id=? AND mp.phase != 'done'
+        ORDER BY mp.updated_at DESC LIMIT 1
+      """, (pid,))
+      if active:
+        effective_status = ('stale' if now - active['updated_at'] > self.settings.progress_stale_sec
+                            else 'working')
+      elif status.get('busy'):
+        effective_status = 'working'
+      else:
+        effective_status = 'idle'
     return {
-      'online': online, 'last_checkin_at': r['last_checkin_at'], 'instance_id': r['instance_id'],
+      'online': online, 'effective_status': effective_status,
+      'last_checkin_at': r['last_checkin_at'], 'instance_id': r['instance_id'],
       'host': r['host'], 'provider': r['provider'], 'runtime': r['runtime'],
       'connector': r['connector'], 'modes': loads(r['modes'], ['queue']),
-      'status': loads(r['status'], {}), 'host_metrics': loads(r['host_metrics'], {}),
+      'status': status, 'host_metrics': loads(r['host_metrics'], {}),
       'capabilities': clean_capabilities(loads(r['capabilities']) if online else None),
     }
 

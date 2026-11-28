@@ -36,6 +36,7 @@ class Database:
     self.conn.execute('PRAGMA journal_mode=WAL')
     self.conn.execute('PRAGMA foreign_keys=ON')
     self.conn.execute('PRAGMA synchronous=NORMAL')
+    self.conn.execute('PRAGMA busy_timeout=5000')
     try:
       os.chmod(self.path, 0o600)
     except OSError:

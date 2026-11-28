@@ -39,15 +39,16 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin, Projec
     now = self.now()
     with self.db.tx() as c:
       went_offline = self.sweep_presence(c, now)
+      reaped_progress = self.sweep_progress(c, now)
       expired, _lapsed = self.sweep_messages(c, now)
       self.events.prune(c, now - self.settings.event_retention_days * 86400)
       self.prune_sessions(c, now)
       self.sweep_orphan_attachments(c, now)
-    if went_offline or expired:
+    if went_offline or expired or reaped_progress:
       self.events.notify()
     # i. Lapsed leases become claimable again; wake long-pollers to retry.
     self.delivery_cv_notify()
-    return {'offline': went_offline, 'expired': expired}
+    return {'offline': went_offline, 'expired': expired, 'reaped_progress': reaped_progress}
 
   def start(self, interval=2.0):
     def loop():

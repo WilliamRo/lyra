@@ -810,6 +810,8 @@ class StageOneTests(ServerCase):
     task = f"tasks/{t['id']}"
     self.api(a, 'PATCH', task, {'title': 'no'}, 403)
     self.api(outside, 'PATCH', task, {'status': 'done'}, 403)
+    self.api(b, 'PATCH', task, {'status': 'in_review'})
+    self.assertEqual(self.api(b, 'GET', 'projects')['projects'][0]['tasks'][0]['status'], 'in_review')
     self.api(b, 'PATCH', task, {'status': 'blocked'})
     for data in ({'assignee_ids': []}, {'assignee_ids': [outside.pid]}, {'status': 'unknown'}, {'priority': True}):
       self.api(pm, 'PATCH', task, data, 422)
@@ -833,11 +835,59 @@ class StageOneTests(ServerCase):
     for name, mime in [('katex.min.css', 'text/css'), ('fonts/KaTeX_Main-Regular.woff2', 'font/woff2')]:
       with urllib.request.urlopen(self.base + '/static/vendor/katex/' + name) as response:
         self.assertEqual(response.headers.get_content_type(), mime)
+        self.assertEqual(response.headers.get('Cache-Control'), 'public, max-age=604800')
+        self.assertIn("style-src-attr 'unsafe-inline'", response.headers.get('Content-Security-Policy', ''))
         self.assertEqual(response.read(), (ROOT / 'lyra_server/static/vendor/katex' / name).read_bytes())
+    with urllib.request.urlopen(self.base + '/static/app.js') as response:
+      self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
     for name in ('', '/app.js', 'vendor//katex', '.private', 'vendor/%2e%2e/app.js', 'vendor%5ckatex'):
       with self.assertRaises(urllib.error.HTTPError) as caught:
         urllib.request.urlopen(self.base + '/static/' + name)
       self.assertEqual(caught.exception.code, 404)
+
+  def test_effective_status_progress_staleness_and_sweeper(self):
+    o = self.owner()
+    a = self.agent(o, 'derived')
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'idle')
+    self.clock.advance(self.settings.checkin_ttl_sec + 1)
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'offline')
+    self.checkin(a, status={'busy': False})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'idle')
+    self.checkin(a, status={'busy': True})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'working')
+    self.checkin(a, status={'busy': False})
+    m1 = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'stall check'})['message']
+    self.api(a, 'PUT', f"messages/{m1['id']}/progress", {'phase': 'working', 'summary': 'step 1'})
+    p1 = self.app.message_view(m1['id'])['progress']
+    self.assertFalse(p1['stale'])
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'working')
+    self.clock.advance(self.settings.progress_stale_sec + 1)
+    self.checkin(a, status={'busy': False})
+    p1_stale = self.app.message_view(m1['id'])['progress']
+    self.assertTrue(p1_stale['stale'])
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'stale')
+    # Offline agent progress is reaped cleanly by sweep_once
+    before_off = self.app.events.latest_id()
+    self.clock.advance(self.settings.checkin_ttl_sec + 1)
+    res_off = self.app.sweep_once()
+    self.assertEqual(res_off['reaped_progress'], 1)
+    self.assertIsNone(self.app.message_view(m1['id'])['progress'])
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'offline')
+    self.assertEqual([e['payload']['phase'] for e in self.app.events.since(before_off)
+                      if e['type'] == 'message_progress'], ['done'])
+    # Online agent progress exceeding progress_ttl_sec is also reaped cleanly
+    self.checkin(a, status={'busy': False})
+    m2 = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'ttl check'})['message']
+    self.api(a, 'PUT', f"messages/{m2['id']}/progress", {'phase': 'working'})
+    for _ in range(int(self.settings.progress_ttl_sec / 30) + 1):
+      self.clock.advance(30)
+      self.checkin(a, status={'busy': False})
+    before_ttl = self.app.events.latest_id()
+    res_ttl = self.app.sweep_once()
+    self.assertEqual(res_ttl['reaped_progress'], 1)
+    self.assertIsNone(self.app.message_view(m2['id'])['progress'])
+    self.assertEqual([e['payload']['phase'] for e in self.app.events.since(before_ttl)
+                      if e['type'] == 'message_progress'], ['done'])
 
   def test_v4_backup_and_restore(self):
     o = self.owner()

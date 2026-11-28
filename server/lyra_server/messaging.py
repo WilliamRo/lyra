@@ -194,7 +194,8 @@ class MessagingMixin:
                 (mid, phase, summary, dumps(bullets) if bullets is not None else None, now))
       self.events.append(c, 'message_progress', id=mid, conversation_id=m['conversation_id'], phase=phase)
     self.events.notify()
-    return {'ok': True, 'progress': {'phase': phase, 'summary': summary, 'bullets': bullets, 'updated_at': now}}
+    return {'ok': True, 'progress': {'phase': phase, 'summary': summary, 'bullets': bullets,
+                                     'updated_at': now, 'stale': False}}
 
   def pin_conversation(self, cid, pinned):
     with self.db.tx() as c:
@@ -301,7 +302,10 @@ class MessagingMixin:
 
   def _progress_view(self, mid):
     row = self.db.one("SELECT phase,summary,bullets,updated_at FROM message_progress WHERE message_id=? AND phase!='done'", (mid,))
-    return {**dict(row), 'bullets': loads(row['bullets'])} if row else None
+    if not row:
+      return None
+    return {**dict(row), 'bullets': loads(row['bullets']),
+            'stale': bool(self.now() - row['updated_at'] > self.settings.progress_stale_sec)}
 
   def _queue_position(self, m, c=None):
     q = ("SELECT COUNT(*) FROM messages WHERE recipient_id=? AND state='waiting' AND "
@@ -499,6 +503,26 @@ class MessagingMixin:
     lapsed = c.execute("SELECT COUNT(*) FROM messages WHERE state='waiting' AND lease_until IS "
                        'NOT NULL AND lease_until < ?', (now,)).fetchone()[0]
     return len(rows), lapsed
+
+  def sweep_progress(self, c, now):
+    """Close active progress rows when the recipient goes offline or exceeds progress_ttl_sec."""
+    checkin_cutoff = now - self.settings.checkin_ttl_sec
+    progress_cutoff = now - self.settings.progress_ttl_sec
+    rows = c.execute("""
+      SELECT mp.message_id, m.conversation_id
+      FROM message_progress mp
+      JOIN messages m ON m.id = mp.message_id
+      LEFT JOIN presence pr ON pr.principal_id = m.recipient_id
+      WHERE mp.phase != 'done'
+        AND (mp.updated_at < ? OR pr.principal_id IS NULL OR pr.online = 0
+             OR pr.last_checkin_at IS NULL OR pr.last_checkin_at < ?)
+    """, (progress_cutoff, checkin_cutoff)).fetchall()
+    for r in rows:
+      c.execute("UPDATE message_progress SET phase='done', updated_at=? WHERE message_id=?",
+                (now, r['message_id']))
+      self.events.append(c, 'message_progress', id=r['message_id'],
+                         conversation_id=r['conversation_id'], phase='done')
+    return len(rows)
 
   def waiting_counts(self, pid):
     rows = self.db.all('SELECT state, COUNT(*) AS n FROM messages WHERE recipient_id=? AND state IN '

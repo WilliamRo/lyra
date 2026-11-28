@@ -92,6 +92,8 @@ class Settings:
   allow_plaintext_bind: bool = False
   checkin_interval_sec: int = 15
   checkin_ttl_sec: int = 45
+  progress_stale_sec: int = 120
+  progress_ttl_sec: int = 1800
   message_ttl_sec: int = 86400
   lease_sec: int = 30
   max_attempts: int = 5

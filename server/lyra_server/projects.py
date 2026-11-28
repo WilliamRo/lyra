@@ -8,7 +8,7 @@ from .events import ApiError
 
 
 PROJECT_STATES = ('active', 'paused', 'completed', 'archived')
-TASK_STATES = ('open', 'in_progress', 'blocked', 'done')
+TASK_STATES = ('open', 'in_progress', 'in_review', 'blocked', 'done')
 
 
 def _text(value, field, required=False):

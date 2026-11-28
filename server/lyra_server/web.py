@@ -19,7 +19,8 @@ from .events import ApiError
 
 log = logging.getLogger('lyra.web')
 
-CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; style-src-elem 'self'; "
+       "style-src-attr 'unsafe-inline'; img-src 'self' data:; "
        "connect-src 'self'; font-src 'self'; manifest-src 'self'; frame-ancestors 'none'; "
        "base-uri 'none'; form-action 'self'")
 STATIC_TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -516,8 +517,9 @@ class Handler(BaseHTTPRequestHandler):
       return self._json(404, {'error': 'not_found'})
     data = res.read_bytes()
     ext = path.suffix.lower()
+    cache = 'public, max-age=604800' if parts[0] == 'vendor' else 'no-cache'
     self._headers(200, STATIC_TYPES.get(ext, 'application/octet-stream'), len(data),
-                  cache='no-cache')
+                  cache=cache)
     self.wfile.write(data)
 
   def _dispatch(self, method):
