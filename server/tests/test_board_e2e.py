@@ -15,6 +15,9 @@
 #     reload, a stalled /auth/me, Details races, draft images (404, transient,
 #     mid-upload navigation), Retry with a new attempt, claim-before-cancel 409,
 #     sidebar clamp and Projects split, theme-aware markdown colors, a11y
+#   - Round 2: pending uploads across A -> B -> A, one refresh batch with board and
+#     conversation events, a failed first snapshot, the reset cursor and transcript
+#     retries, a hung reconnect (watchdog), task dialog generations, 401 sign-out
 #   - zero page errors, console errors or CSP violations (except failures the
 #     probe injected on purpose), and no element that crosses its container
 #   - visual QA screenshots in light and dark (kept when LYRA_QA_SHOTS=<dir>)
@@ -26,6 +29,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 
 JS = Path(__file__).resolve().parent / 'js'
@@ -72,10 +76,10 @@ class WiredBoardTests(unittest.TestCase):
     self.assertEqual(result['overflow'], [], 'elements crossing their containers')
 
   def test_desktop_board_light(self):
-    self.check(self.run_probe(1440, 900), 'desktop', 44)
+    self.check(self.run_probe(1440, 900), 'desktop', 49)
 
   def test_desktop_board_dark(self):
-    self.check(self.run_probe(1440, 900, theme='dark'), 'desktop', 44, theme='dark')
+    self.check(self.run_probe(1440, 900, theme='dark'), 'desktop', 49, theme='dark')
 
   def test_phone_board_light(self):
     r = self.run_probe(390, 844, mobile=True, dpr=2)
@@ -102,6 +106,56 @@ class WiredBoardTests(unittest.TestCase):
     self.assertIsNotNone(board['end'])
     self.assertLessEqual(board['end'], convs['start'], 'conversations requested before the board snapshot finished')
     self.assertLessEqual(convs['end'], events['start'], 'event stream opened before conversations loaded')
+
+  def arm(self, kind, path, **rule):
+    with self.proxy.qa.lock:
+      getattr(self.proxy.qa, kind).append(dict(path=path, **rule))
+      self.proxy.qa.expected.add(path)
+
+  def test_initial_board_failure_retries_and_restores_the_thread(self):
+    chrome = Chrome().open_page(1440, 900)
+    try:
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.querySelectorAll('.conv-row').length >= 5", timeout=20)
+      chrome.eval("[...document.querySelectorAll('.conv-row')].find((r) => r.querySelector('.conv-title span').textContent"
+                  " === 'Claude').querySelector('.conv-main').click()")
+      chrome.wait_for("document.getElementById('conv-header').textContent.includes('Claude')")
+      # The first snapshot after a reload fails once: the banner stays, the label is not "live",
+      # and the retry restores the same conversation.
+      self.arm('fail', '/api/v1/board', status=503, count=1)
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.getElementById('conn-text').textContent.includes('Could not load the board')", timeout=10)
+      self.assertNotEqual(chrome.eval("document.querySelector('#live .live-text').textContent"), 'live')
+      chrome.wait_for("document.getElementById('conn-banner').hidden && document.getElementById('live').classList.contains('on')"
+                      " && document.querySelectorAll('#roster .agent').length >= 6", timeout=20)
+      self.assertIn('Claude', chrome.eval("document.getElementById('conv-header').textContent"))
+      self.assertTrue(chrome.eval("document.querySelectorAll('#messages .msg').length > 0"))
+      statuses = [e['status'] for e in self.proxy.qa.log if e['path'] == '/api/v1/board' and e['method'] == 'GET']
+      self.assertIn(503, statuses)
+      self.assertEqual(statuses[-1], 200)
+      expected = set(self.proxy.qa.expected)
+      self.assertEqual([p for p in chrome.console_problems() if not any(e in p for e in expected)], [])
+    finally:
+      chrome.close()
+
+  def test_watchdog_recovers_a_connect_that_never_answers(self):
+    # A reconnect whose response headers never arrive stays CONNECTING; the 30 s watchdog must
+    # still drop it and connect again.
+    chrome = Chrome().open_page(1440, 900)
+    try:
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.getElementById('live').classList.contains('on')", timeout=20)
+      self.arm('stall', '/api/v1/events', ms=120000, count=1)      # outlasts the wait: only the watchdog can help
+      chrome.eval("fetch('/__qa/drop-sse').then(() => true)")
+      chrome.wait_for("!document.getElementById('conn-banner').hidden", timeout=5)
+      t0 = time.monotonic()
+      chrome.wait_for("document.getElementById('live').classList.contains('on')", timeout=50, interval=0.5)
+      waited = time.monotonic() - t0
+      self.assertGreater(waited, 25, 'reconnected without waiting out the hung connect')
+      connects = [e for e in self.proxy.qa.log if e['path'] == '/api/v1/events']
+      self.assertGreaterEqual(len(connects), 3)          # first stream, the hung one, the recovery
+    finally:
+      chrome.close()
 
   def test_sidebar_clamp_and_projects_split(self):
     chrome = Chrome().open_page(1100, 900)

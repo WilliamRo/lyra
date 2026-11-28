@@ -40,7 +40,7 @@ const S = {
   sending: false, staged: [], navigation: 0, optimistic: [], readInFlight: {},
   pending: { board: false, convs: false, conv: false, timer: null }, receiptNodes: new Map(),
   qs: { items: [], all: [], sel: 0 }, needs: [], needsKeys: null, failed: new Map(), notifyConvs: new Set(),
-  audio: null, menuHost: null, seenEventId: null,
+  audio: null, menuHost: null, seenEventId: null, session: new AbortController(), pendingUploads: new Map(),
   resync: { pending: false, inflight: false, again: false, attempt: 0, timer: null, latest: null },
 };
 
@@ -201,6 +201,16 @@ function avatar(p, size, opts) {
 // =============================================================================
 
 // extra: { signal } to cancel, or { timeoutMs } to bound a request that might stall.
+function anySignal(signals) {
+  if (AbortSignal.any) return AbortSignal.any(signals);
+  const ac = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) { ac.abort(); break; }
+    s.addEventListener('abort', () => ac.abort(), { once: true });
+  }
+  return ac.signal;
+}
+
 async function api(method, path, body, headers = {}, extra = {}) {
   const opts = { method, credentials: 'same-origin', headers };
   if (body instanceof File) opts.body = body;
@@ -208,13 +218,16 @@ async function api(method, path, body, headers = {}, extra = {}) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
+  // Every request belongs to the current session: signing out aborts whatever is still running.
   let timer = null;
-  if (extra.signal) opts.signal = extra.signal;
-  else if (extra.timeoutMs) {
+  const signals = [S.session.signal];
+  if (extra.signal) signals.push(extra.signal);
+  if (extra.timeoutMs) {
     const ac = new AbortController();
-    opts.signal = ac.signal;
+    signals.push(ac.signal);
     timer = setTimeout(() => ac.abort(), extra.timeoutMs);
   }
+  opts.signal = signals.length === 1 ? signals[0] : anySignal(signals);
   let res;
   try { res = await fetch(path, opts); } finally { clearTimeout(timer); }
   let data = {};
@@ -230,7 +243,15 @@ async function api(method, path, body, headers = {}, extra = {}) {
 
 function showLogin() {
   // Drafts and view state stay in localStorage, so the same thread returns after sign-in.
+  // The ended session's work stops: no resync retries, no requests still in flight.
   stopEvents();
+  const r = S.resync;
+  clearTimeout(r.timer);
+  r.pending = false; r.inflight = false; r.again = false; r.attempt = 0; r.initial = false;
+  clearTimeout(S.pending.timer);
+  S.pending.board = S.pending.convs = S.pending.conv = false;
+  S.session.abort();
+  S.session = new AbortController();
   $('main').hidden = true;
   $('login').hidden = false;
   setTimeout(() => $('login-user').focus(), 0);
@@ -246,7 +267,9 @@ async function boot() {
   try {
     await refreshAll(true);
   } catch (e) {
-    setConn(false, 'Could not load the board: ' + e.message);
+    if (e.status === 401 || e.name === 'AbortError') return;      // the sign-in card is showing
+    // No snapshot yet: retry with backoff, and restore the open conversation once it loads.
+    startResync(null, { initial: true, failedOnce: true });
   }
   connectEvents();
 }
@@ -443,13 +466,13 @@ async function refreshAll(initial) {
   renderSenate();
   renderTitle();
   if (initial) {
-    if (S.view.selectedConvId != null) await openConv(S.view.selectedConvId, { restore: true });
+    if (S.view.selectedConvId != null) await openConv(S.view.selectedConvId, { restore: true, propagate: true });
     else if (S.view.pendingAgentId != null) {
       const a = agentById(S.view.pendingAgentId);
       if (a) openWith(a, { restore: true }); else renderThread();
     } else renderThread();
   } else if (S.conv && S.conv.id) {
-    await reloadConv();
+    await reloadConv({ propagate: true });      // a failed transcript reload fails the resync too
   } else {
     renderThread();
   }
@@ -472,16 +495,12 @@ async function runRefresh() {
     const [board, convs] = await Promise.all([
       want.board ? api('GET', '/api/v1/board') : null,
       want.convs ? api('GET', '/api/v1/conversations') : null]);
-    if (board) {
-      S.board = board;
-      renderAgents(); renderProjects(); renderSenate();
-    }
-    if (convs) {
-      S.convs = convs.conversations || [];
-      renderConvList();
-      notifyNewMessages();
-      if (S.board && !board) renderAgents();      // agent rows show unread counts
-    }
+    // Both snapshots first, then every view: agent rows read conversation unread counts.
+    if (board) S.board = board;
+    if (convs) S.convs = convs.conversations || [];
+    if (board) { renderProjects(); renderSenate(); }
+    if (convs) { renderConvList(); notifyNewMessages(); }
+    if (S.board && (board || convs)) renderAgents();
     if (board || convs) renderTitle();
     if ((want.conv || board) && S.conv && S.conv.id) await reloadConv();
     else if (board && S.conv) { renderThreadHeader(); renderComposer(); }
@@ -512,10 +531,10 @@ function connectEvents() {
     S.conn.lastBeat = Date.now();
     setConn(true);
     if (recovered) {
-      showBanner('Back online. Refreshing…', true);
+      if (!S.resync.pending) showBanner('Back online. Refreshing…', true);
       startResync(null);
     } else if (!S.resync.pending) {
-      $('conn-banner').hidden = true;
+      $('conn-banner').hidden = true;        // never hides a pending resync's error banner
     }
   };
   es.onerror = () => dropConnection(es);      // also covers failures before the stream ever opened
@@ -535,44 +554,63 @@ function dropConnection(es) {
 
 // Reload the board after a reset or a reconnect. The cursor only moves once the reload worked;
 // failures retry with backoff behind the banner.
-async function startResync(latest) {
+async function startResync(latest, opts) {
   const r = S.resync;
+  const o = opts || {};
   if (latest != null) r.latest = String(latest);
+  if (o.initial) r.initial = true;          // the first snapshot never loaded: restore the view on success
   r.pending = true;
+  setConn(S.conn.up);
+  if (o.failedOnce) { retryResync(); return; }
   if (r.inflight) { r.again = true; return; }
   clearTimeout(r.timer);
   r.inflight = true;
+  const session = S.session;
   try {
-    await refreshAll(false);
+    await refreshAll(r.initial);
+    if (session !== S.session) return;      // signed out meanwhile
     r.inflight = false;
     if (r.again) { r.again = false; startResync(null); return; }
     r.pending = false;
+    r.initial = false;
     r.attempt = 0;
     S.lastEventId = S.seenEventId || r.latest || S.lastEventId;
+    setConn(S.conn.up);
     if (S.conn.up) {
       showBanner('Back online.', true);
       setTimeout(() => { if (S.conn.up && !S.resync.pending) $('conn-banner').hidden = true; }, 1500);
     }
-  } catch (_e) {
+  } catch (e) {
+    if (session !== S.session) return;
     r.inflight = false;
     r.again = false;
-    r.attempt += 1;
-    const delay = Math.min(30, Math.pow(2, r.attempt)) * (0.5 + Math.random() * 0.5);
-    showBanner(`Could not reload the board. Resyncing in ${Math.max(1, Math.round(delay))} s…`, false);
-    r.timer = setTimeout(() => startResync(null), delay * 1000);
+    if (e.status === 401 || e.name === 'AbortError') { r.pending = false; return; }   // sign-in card, no retries
+    retryResync();
   }
 }
 
-// Health watchdog: a silent stream (no tick or event for 30 s) is treated as dead.
+function retryResync() {
+  const r = S.resync;
+  clearTimeout(r.timer);
+  r.attempt += 1;
+  const delay = Math.min(30, Math.pow(2, r.attempt)) * (0.5 + Math.random() * 0.5);
+  showBanner(`Could not ${S.board ? 'reload' : 'load'} the board. Resyncing in ${Math.max(1, Math.round(delay))} s…`, false);
+  r.timer = setTimeout(() => startResync(null), delay * 1000);
+}
+
+// Health watchdog: a silent stream (no tick or event for 30 s) is treated as dead. lastBeat starts
+// when the EventSource is created, so a connect whose response never arrives is caught too.
 setInterval(() => {
-  if (S.es && S.conn.up && Date.now() - S.conn.lastBeat > WATCHDOG_MS) dropConnection(S.es);
+  if (S.es && Date.now() - S.conn.lastBeat > WATCHDOG_MS) dropConnection(S.es);
 }, 5000);
 
 function onEvent(type, ev) {
   S.conn.lastBeat = Date.now();
   if (ev.lastEventId) {
     S.seenEventId = ev.lastEventId;
-    if (!S.resync.pending) S.lastEventId = ev.lastEventId;    // held back until a pending reload succeeds
+    // Held back while a reload is pending, and never taken from a reset frame (it names the server's
+    // newest event, which is only ours once the reload has succeeded).
+    if (!S.resync.pending && type !== 'reset') S.lastEventId = ev.lastEventId;
   }
   if (type === 'tick') return;
   let d = {};
@@ -600,9 +638,10 @@ function onEvent(type, ev) {
 function setConn(up, text) {
   S.conn.up = up;
   const live = $('live');
-  live.querySelector('.live-text').textContent = up ? 'live' : 'offline';
-  live.classList.toggle('on', up);
-  live.classList.toggle('off', !up);
+  const syncing = up && S.resync.pending;    // connected, but the board is not current yet
+  live.querySelector('.live-text').textContent = !up ? 'offline' : syncing ? 'syncing' : 'live';
+  live.classList.toggle('on', up && !syncing);
+  live.classList.toggle('off', !up || syncing);
   if (text) showBanner(text, false);
 }
 
@@ -1481,9 +1520,10 @@ async function openConv(id, opts) {
   renderTabs();
   renderConvList();
   renderThread();
-  await reloadConv({ toBottom: true });
+  await reloadConv({ toBottom: true, propagate: !!o.propagate });
 }
 
+// opts.propagate: rethrow failures other than 404/403 (resync callers retry); others swallow them.
 async function reloadConv(opts) {
   if (!S.conv || S.conv.id == null) return;
   const navigation = S.navigation;
@@ -1509,6 +1549,8 @@ async function reloadConv(opts) {
   } catch (e) {
     if (e.status === 404 || e.status === 403) {
       S.conv = null; S.view.selectedConvId = null; saveView(); renderThread();
+    } else if (opts && opts.propagate) {
+      throw e;
     }
   }
 }
@@ -1815,6 +1857,10 @@ function restoreDraft() {
   if (d && d.replyToId) S.replyTo = { id: d.replyToId, pending: true };
   S.draftMode = d ? d.mode : null;
   S.staged = d ? d.attachments.map((a) => ({ name: a.filename, image: a, restored: true, draftKey: key, token: clientId() })) : [];
+  // Uploads still running for this draft come back as their own placeholders (Send stays disabled).
+  for (const item of (S.pendingUploads.get(key) || [])) {
+    if (!item.removed && !S.staged.includes(item)) S.staged.push(item);
+  }
   $('draft-hint').textContent = d && (d.text || d.attachments.length) ? 'Draft restored' : '';
   autoGrow();
 }
@@ -1988,25 +2034,54 @@ async function stageImages(files) {
     }
     const item = { name: file.name, token: clientId(), draftKey: key };
     staged.push(item);
+    trackUpload(item);
     renderImages();
     api('POST', '/api/v1/attachments', file, { 'X-Filename': encodeURIComponent(file.name) })
       .then((r) => {
         item.image = r.attachment;
+        untrackUpload(item);
         if (item.removed) return;
-        if (staged === S.staged) saveDraft();           // still on the chat it started in
-        else addToStoredDraft(item.draftKey, item);      // the owner moved on: keep it in that draft
+        if (draftKey() === item.draftKey) {             // on that chat now (even after A -> B -> A)
+          if (!S.staged.includes(item)) S.staged.push(item);
+          saveDraft();
+        } else {
+          addToStoredDraft(item.draftKey, item);         // the owner moved on: keep it in that draft
+        }
       })
       .catch((e) => {
-        if (staged === S.staged && staged.includes(item)) {
-          staged.splice(staged.indexOf(item), 1);
-          error.textContent = e.message;
+        untrackUpload(item);
+        if (draftKey() === item.draftKey && S.staged.includes(item)) {
+          S.staged.splice(S.staged.indexOf(item), 1);
+          error.textContent = e.name === 'AbortError' ? '' : e.message;
         }
-      }).finally(() => { if (staged === S.staged) renderImages(); });
+      }).finally(() => { if (draftKey() === item.draftKey) renderImages(); });
   }
 }
 
+// In-flight uploads per draft key, so a placeholder survives switching chats and back.
+function trackUpload(item) {
+  if (!S.pendingUploads.has(item.draftKey)) S.pendingUploads.set(item.draftKey, new Set());
+  S.pendingUploads.get(item.draftKey).add(item);
+}
+
+function untrackUpload(item) {
+  const set = S.pendingUploads.get(item.draftKey);
+  if (!set) return;
+  set.delete(item);
+  if (!set.size) S.pendingUploads.delete(item.draftKey);
+}
+
 $('compose-attach').addEventListener('click', () => {
-  if ($('compose-attach').getAttribute('aria-disabled') === 'true') return;   // the tooltip explains why
+  const attach = $('compose-attach');
+  if (attach.getAttribute('aria-disabled') === 'true') {
+    attach.focus();                       // shows the tooltip
+    if (!supportsImages(recipientAgent())) {
+      const note = $('compose-image-note');   // touch screens have no hover: say it in the composer too
+      note.textContent = 'Text only: this agent does not accept images';
+      note.hidden = false;
+    }
+    return;
+  }
   $('compose-files').click();
 });
 $('compose-files').addEventListener('change', (ev) => { stageImages(Array.from(ev.target.files)); ev.target.value = ''; });
@@ -2288,6 +2363,7 @@ function memberChecks(root, people, selected, locked) {
 let editingProject = null;
 let editingTask = null;
 let editingTaskVersion = null;      // the version the owner opened; a newer one on the server is a conflict
+let taskDialogSeq = 0;              // bumps on open and close: late responses for an older dialog are dropped
 let conflictTask = null;
 let taskProject = null;
 
@@ -2346,6 +2422,7 @@ function syncBlockedField() {
 }
 
 function openTaskDialog(p, t, preset) {
+  taskDialogSeq += 1;
   taskProject = p;
   editingTask = t;
   editingTaskVersion = t ? t.version : null;
@@ -2380,28 +2457,38 @@ $('task-form').addEventListener('submit', async (ev) => {
     status: $('tf-status').value, priority: Number($('tf-priority').value), assignee_ids: ids };
   if (!body.title) { $('tf-error').textContent = 'Enter a task title.'; return; }
   if (body.status === 'blocked') body.blocked_reason = $('tf-blocked').value.trim() || null;
+  const seq = taskDialogSeq;
+  const task = editingTask;
+  const project = taskProject;
   try {
-    if (editingTask) {
-      await api('PATCH', `/api/v1/tasks/${editingTask.id}`, Object.assign({ expected_version: editingTaskVersion }, body));
+    if (task) {
+      await api('PATCH', `/api/v1/tasks/${task.id}`, Object.assign({ expected_version: editingTaskVersion }, body));
     } else {
-      await api('POST', `/api/v1/projects/${taskProject.id}/tasks`, body);
+      await api('POST', `/api/v1/projects/${project.id}/tasks`, body);
     }
-    $('task-dialog').close();
     schedule({ board: true });
+    if (seq === taskDialogSeq) $('task-dialog').close();     // never closes a dialog opened since
   } catch (e) {
-    if (e.data && e.data.error === 'version_conflict') await showTaskConflict();
+    if (seq !== taskDialogSeq) return;
+    if (e.data && e.data.error === 'version_conflict') await showTaskConflict(seq);
     else $('tf-error').textContent = e.message;
   }
 });
+$('task-dialog').addEventListener('close', () => { taskDialogSeq += 1; });
 
 // Someone else saved first: show their version next to the owner's unsaved edits. Saving again
 // is then a deliberate overwrite of exactly that version.
-async function showTaskConflict() {
+async function showTaskConflict(seq) {
   $('tf-error').textContent = '';
-  try {
-    S.board = await api('GET', '/api/v1/board');
-    renderAgents(); renderProjects(); renderSenate();
-  } catch (e) { $('tf-error').textContent = `This task changed elsewhere and the latest version could not be loaded: ${e.message}`; return; }
+  let board;
+  try { board = await api('GET', '/api/v1/board'); }
+  catch (e) {
+    if (seq === taskDialogSeq) $('tf-error').textContent = `This task changed elsewhere and the latest version could not be loaded: ${e.message}`;
+    return;
+  }
+  S.board = board;
+  renderAgents(); renderProjects(); renderSenate();
+  if (seq !== taskDialogSeq) return;          // the owner moved on to another task meanwhile
   const latest = editingTask && findTask(editingTask.id);
   if (!latest) { $('tf-error').textContent = 'This task no longer exists.'; return; }
   conflictTask = latest;

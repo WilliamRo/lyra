@@ -12,6 +12,7 @@
 #                                              server, so it answers with `event: reset`
 #                    /__qa/claim?handle&ack    let a seeded agent claim (and ack) a message
 #                    /__qa/expect?path         mark a deliberate error response as expected
+#                    /__qa/say?handle&text     a seeded agent posts a message to the owner
 #                    /__qa/log                 the request log as JSON
 # Nothing here ships: it lives under server/tests and the server is unchanged.
 # =============================================================================
@@ -387,6 +388,9 @@ class _ProxyHandler(BaseHTTPRequestHandler):
       if got.get('lease_id') and ack != 'none':
         agent.call('POST', f"/api/v1/deliveries/{got['lease_id']}/{ack}", {})
       return self._json(200, {'message_id': (got.get('message') or {}).get('id'), 'reason': got.get('reason')})
+    if name == 'say':                          # a seeded agent posts a message to the owner
+      self.board.agents[one('handle')].call('POST', '/api/v1/messages', {'to': 'owner', 'body': one('text', 'hello')})
+      return self._json(200, {'said': True})
     if name == 'log':
       with qa.lock:
         return self._json(200, {'log': list(qa.log), 'expected': sorted(qa.expected)})
@@ -396,7 +400,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     u = urlsplit(self.path)
     if u.path.startswith('/__qa/'):
       name = u.path[len('/__qa/'):]
-      if self._hook(name, parse_qs(u.query)) is not None or name in ('fail', 'stall', 'expect', 'reset-next', 'claim', 'log'):
+      if self._hook(name, parse_qs(u.query)) is not None or name in ('fail', 'stall', 'expect', 'reset-next', 'claim',
+                                                                       'say', 'log'):
         return
       if name == 'drop-sse':
         with self.sse_lock:
@@ -416,7 +421,8 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     n = int(self.headers.get('Content-Length') or 0)
     body = self.rfile.read(n) if n else None
     board = self.board
-    entry = {'method': self.command, 'path': u.path, 'start': time.monotonic(), 'end': None, 'status': None}
+    entry = {'method': self.command, 'path': u.path, 'query': u.query, 'start': time.monotonic(), 'end': None,
+             'status': None}
     with self.qa.lock:
       self.qa.log.append(entry)
     failing = self.qa.take(self.qa.fail, u.path)

@@ -45,6 +45,17 @@
     headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
     .then(async (r) => ({ status: r.status, data: await r.json().catch(() => ({})) }));
   const convId = (title) => convRow(title).dataset.convId;
+  const requests = async (path, method) => (await hook('log')).log.filter((e) => e.path === path && (!method || e.method === method));
+  async function untilAsync(fn, ms, label) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (ms || 6000)) {
+      const v = await fn();
+      if (v) return v;
+      await wait(100);
+    }
+    throw new Error('timed out waiting for ' + label);
+  }
+  const calm = () => until(() => q('#live').classList.contains('on') && q('#conn-banner').hidden, 12000, 'calm connection');
   const state = () => JSON.parse(localStorage.getItem('lyra.ui.v2.state'));
   function rgb(c) { const m = c.match(/[\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m[3] == null ? 1 : m[3] }; }
   function over(top, base) { return { r: top.r * top.a + base.r * (1 - top.a), g: top.g * top.a + base.g * (1 - top.a), b: top.b * top.a + base.b * (1 - top.a), a: 1 }; }
@@ -158,6 +169,22 @@
       const r = await api('POST', `/api/v1/conversations/${id}/read`, { last_read_message_id: msgs[msgs.length - 1].id });
       ok(r.status === 200, 'read ' + r.status);
       await until(() => row().querySelector('.agent-extra').textContent.indexOf('unread') === -1, 4000, 'unread cleared by the event');
+    });
+    await step('agents: a conversation event and a board event in one batch still repaint unread', async () => {
+      const row = () => qa('#roster .agent').find((a) => a.querySelector('.agent-name') && a.querySelector('.agent-name').textContent === 'Echo');
+      await until(() => row().querySelector('.agent-extra').textContent.indexOf('unread') === -1, 3000, 'echo starts read');
+      const say = await hook('say?handle=echo&text=' + encodeURIComponent('Unread from Echo'));
+      ok(say.said, 'say');
+      await until(() => row().querySelector('.agent-extra').textContent.indexOf('1 unread') !== -1, 4000, 'unread shown');
+      const id = convId('Echo');
+      const msgs = (await api('GET', `/api/v1/conversations/${id}/messages?limit=300`)).data.messages;
+      const pool = (await api('GET', '/api/v1/board')).data.pools[0];
+      // Same 200 ms batch: a conversation event (read cursor) and a board event (pool notes).
+      const [read, patch] = await Promise.all([
+        api('POST', `/api/v1/conversations/${id}/read`, { last_read_message_id: msgs[msgs.length - 1].id }),
+        api('PATCH', `/api/v1/admin/pools/${pool.id}`, { notes: 'Batch test ' + Date.now() })]);
+      ok(read.status === 200 && patch.status === 200, 'calls ' + read.status + ' ' + patch.status);
+      await until(() => row().querySelector('.agent-extra').textContent.indexOf('unread') === -1, 4000, 'unread cleared in the combined batch');
     });
     await step('agents: group switch is a radiogroup with roving tabindex', async () => {
       const m = q('.seg-btn[data-group="machine"]'); const pv = q('.seg-btn[data-group="provider"]');
@@ -327,35 +354,40 @@
       q('.lyra-imgpop-close').click();
       await until(() => !q('#imgpop-dialog').open, 2000, 'viewer closed');
     });
-    await step('composer: paperclip control with tooltip; draft text and images persist', async () => {
+    await step('composer: paperclip control; A -> B -> A keeps a pending upload and Send waits for it', async () => {
       const attach = q('#compose-attach');
-      ok(attach.getAttribute('aria-label') === 'Attach image' && !attach.disabled, 'enabled for an image agent');
+      ok(attach.getAttribute('aria-label') === 'Attach image' && attach.getAttribute('aria-disabled') === 'false', 'enabled for an image agent');
       ok(q('#compose-attach-tip').getAttribute('data-tip') === 'Attach image', 'tooltip');
       ok(q('#compose-attach svg'), 'icon');
-      // The upload is still running when the owner switches chats: it must land in Dario's draft.
-      await hook('stall?path=/api/v1/attachments&ms=1500&count=1');
+      await hook('stall?path=/api/v1/attachments&ms=2500&count=1');
       const dt = new DataTransfer();
       dt.items.add(await pngFile('sketch.png'));
       q('#composer').dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
       await until(() => q('#compose-attachments .staged-uploading'), 2000, 'uploading tile');
       await openConvByTitle('Echo');
-      await wait(2000);
+      ok(!q('#compose-attachments .staged-image'), 'no tile in Echo');
       await openConvByTitle('Dario');
-      await until(() => q('#compose-attachments .staged-image img'), 4000, 'upload saved into the originating draft');
+      ok(q('#compose-attachments .staged-uploading'), 'pending placeholder back in Dario');
       const box = q('#compose-body');
-      box.value = 'Draft for Dario';
+      box.value = 'Sketch attached';
       box.dispatchEvent(new Event('input', { bubbles: true }));
-      const keyName = Object.keys(localStorage).find((k) => k.indexOf('lyra.ui.v2.draft.conv:') === 0);
+      ok(q('#compose-send').disabled, 'Send waits for the upload');
+      key(box, 'Enter', { ctrlKey: true });
+      ok(!qa('#messages .msg.mine').some((m) => m.textContent.indexOf('Sketch attached') !== -1), 'Ctrl+Enter sent early');
+      await until(() => q('#compose-attachments .staged-image img') && !q('#compose-send').disabled, 6000, 'upload finished');
+      const keyName = 'lyra.ui.v2.draft.conv:' + convId('Dario');
       ok(JSON.parse(localStorage.getItem(keyName)).attachments.length === 1, 'image in the draft');
       await openConvByTitle('Echo');
-      ok(!q('#compose-attachments .staged-image'), 'other conversation has no images');
       await openConvByTitle('Dario');
-      ok(q('#compose-body').value === 'Draft for Dario', 'text restored');
+      ok(q('#compose-body').value === 'Sketch attached', 'text restored');
       await until(() => q('#compose-attachments .staged-image img'), 3000, 'image restored');
       await noCrossing('composer');
-      q('#compose-attachments .remove').click();
-      box.value = '';
-      box.dispatchEvent(new Event('input', { bubbles: true }));
+      q('#composer').requestSubmit();
+      await until(() => qa('#messages .msg.mine:not(.local)').some((m) => m.dataset.msgId && m.textContent.indexOf('Sketch attached') !== -1
+        && m.querySelector('.image-strip img')), 6000, 'accepted by the server with the image');
+      const left = localStorage.getItem(keyName);
+      ok(!left || JSON.parse(left).attachments.length === 0, 'draft cleared after sending');
+      ok(!q('#compose-attachments .staged-image'), 'composer empty');
     });
     await step('draft images: a transient error keeps the image, a 404 removes it', async () => {
       const keep = await upload('keep.png');
@@ -404,8 +436,11 @@
       const files = q('#compose-files'); let opened = false;
       const spy = () => { opened = true; };
       files.addEventListener('click', spy, { once: true });
+      attach.blur();
       attach.click();
       ok(!opened, 'file picker opened while disabled');
+      ok(document.activeElement === attach, 'tap focuses the control (tooltip)');
+      ok(!q('#compose-image-note').hidden && q('#compose-image-note').textContent === 'Text only: this agent does not accept images', 'tap explains why');
       files.removeEventListener('click', spy);
       attach.blur();
       const before = qa('#messages .receipt[data-kind="cancelled"]').length;
@@ -429,7 +464,7 @@
       ok(q(`#messages .msg[data-msg-id="${msg}"] .pill`).textContent === 'retried', 'retried pill');
       const claimed = await hook('claim?handle=echo&ack=delivered');
       ok(String(claimed.message_id) === msg, 'echo claimed ' + JSON.stringify(claimed));
-      await until(() => q(`#messages .msg[data-msg-id="${msg}"] .receipt[data-kind="read"]`), 4000, 'agent read');
+      await until(() => q(`#messages .msg[data-msg-id="${msg}"] .receipt[data-kind="read"], #messages .msg[data-msg-id="${msg}"] .receipt[data-kind="replied"]`), 4000, 'agent read');
       qa(`#messages .msg[data-msg-id="${msg}"] .rc-btn`).find((b) => b.textContent === 'Details').click();
       await until(() => qa('#lifecycle-body table.attempts tbody tr').length === 2, 4000, 'two attempts');
       ok(q('#lifecycle-body table.attempts tbody tr:last-child').textContent.indexOf('delivered') !== -1, 'new attempt delivered');
@@ -526,6 +561,27 @@
       await until(() => !q('#task-dialog').open, 4000, 'deliberate save');
       await until(() => qa('.task-title').some((x) => x.textContent === 'KaTeX font MIME types (mine)'), 4000, 'mine saved');
     });
+    await step('tasks: a late save for task A never closes the dialog opened for task B', async () => {
+      const proj = (await api('GET', '/api/v1/projects')).data.projects.find((p) => p.name === 'Route audit');
+      const a = proj.tasks.find((x) => x.title === 'Write QA checklist');
+      const rowA = qa('.task').find((x) => x.dataset.taskId === String(a.id));
+      qa('button', rowA).find((b) => b.textContent === 'Edit').click();
+      await until(() => q('#task-dialog').open && q('#tf-title').value === 'Write QA checklist', 2000, 'dialog A');
+      await hook(`stall?path=/api/v1/tasks/${a.id}&ms=1500&count=1`);
+      q('#tf-desc').value = 'Edited in dialog A';
+      q('#task-form').requestSubmit();
+      await wait(100);
+      q('#task-dialog').close();
+      const rowB = qa('.task').find((x) => x.querySelector('.task-title').textContent === 'Load test on studio-linux');
+      qa('button', rowB).find((b) => b.textContent === 'Edit').click();
+      await until(() => q('#task-dialog').open && q('#tf-title').value === 'Load test on studio-linux', 2000, 'dialog B');
+      await wait(2000);                     // A's save lands meanwhile
+      ok(q('#task-dialog').open && q('#tf-title').value === 'Load test on studio-linux', 'dialog B closed or changed by A');
+      ok(q('#tf-conflict').hidden && q('#tf-error').textContent === '', 'no stale conflict or error');
+      q('#task-dialog').close();
+      const fresh = (await api('GET', '/api/v1/projects')).data.projects.find((p) => p.name === 'Route audit').tasks.find((x) => x.id === a.id);
+      ok(fresh.description === 'Edited in dialog A', 'A saved');
+    });
     await step('task dialog lists only project members and requires one', async () => {
       qa('button').find((b) => b.textContent === 'New task').click();
       await until(() => q('#task-dialog').open, 2000, 'task dialog');
@@ -569,6 +625,47 @@
       await until(() => !q('#conn-banner').hidden && q('#conn-text').textContent.indexOf('Resyncing') !== -1, 8000, 'resync banner');
       await until(() => q('#conn-banner').hidden && q('#live').classList.contains('on'), 10000, 'resynced');
       ok(qa('#roster .agent').length >= 6, 'board reloaded');
+    });
+    await step('reset: the cursor stays put while the reload keeps failing', async () => {
+      await calm();
+      await hook('fail?path=/api/v1/board&status=503&count=2');
+      await hook('reset-next');
+      const before = (await requests('/api/v1/events')).length;
+      await fetch('/__qa/drop-sse');
+      await until(() => !q('#conn-banner').hidden && q('#conn-text').textContent.indexOf('Resyncing') !== -1, 8000, 'resync banner');
+      ok(q('#live .live-text').textContent !== 'live', 'live label while the board is stale: ' + q('#live .live-text').textContent);
+      const first = (await requests('/api/v1/events'))[before];
+      await fetch('/__qa/drop-sse');          // the stream drops again before the reload has worked
+      const second = await untilAsync(async () => (await requests('/api/v1/events'))[before + 1], 8000, 'second reconnect');
+      ok(first.query && second.query === first.query, `cursor moved: ${first.query} -> ${second.query}`);
+      await until(() => q('#conn-banner').hidden && q('#live').classList.contains('on'), 15000, 'resynced');
+    });
+    await step('resync: a failing transcript reload retries, then shows messages sent meanwhile', async () => {
+      await openConvByTitle('Dario');
+      await calm();
+      const id = convId('Dario');
+      await hook(`fail?path=/api/v1/conversations/${id}/messages&status=503&count=2`);
+      await hook('reset-next');
+      await fetch('/__qa/drop-sse');
+      await hook('say?handle=dario&text=' + encodeURIComponent('Posted while you were away'));
+      await until(() => q('#messages').textContent.indexOf('Posted while you were away') !== -1 && q('#conn-banner').hidden
+        && q('#live').classList.contains('on'), 15000, 'transcript reloaded after the retry');
+      ok((await requests(`/api/v1/conversations/${id}/messages`)).some((e) => e.status === 503), 'the transcript failed first');
+    });
+    await step('401 during a resync: sign-in card, no more retries, back after signing in', async () => {
+      await calm();
+      await hook('fail?path=/api/v1/board&status=401&count=1');
+      await hook('reset-next');
+      await fetch('/__qa/drop-sse');
+      await until(() => !q('#login').hidden && q('#main').hidden, 8000, 'sign-in card');
+      const n1 = (await requests('/api/v1/board', 'GET')).length;
+      await wait(3500);
+      const n2 = (await requests('/api/v1/board', 'GET')).length;
+      ok(n1 === n2, `board requested ${n2 - n1} more times after the 401`);
+      q('#login-user').value = 'owner';
+      q('#login-pass').value = 'correct horse battery';
+      q('#login-form').requestSubmit();
+      await until(() => !q('#main').hidden && qa('#roster .agent').length >= 6 && q('#live').classList.contains('on'), 10000, 'signed in again');
     });
     await step('reconnect: a stalled /auth/me never delays the banner or the retry', async () => {
       await hook('stall?path=/api/v1/auth/me&ms=8000&count=1');
