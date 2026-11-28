@@ -50,9 +50,14 @@ class RegistryMixin:
 
   # --- invites -------------------------------------------------------------
 
-  def create_invite(self, display_name=None, handle=None, pool_id=None, target_principal_id=None):
+  def create_invite(self, display_name=None, handle=None, pool_id=None, target_principal_id=None,
+                    issued_by_principal_id=None, reason=None, require_reason=False):
     now = self.now()
     handle = _clip(handle, 32)
+    reason = _clip(reason, 400)
+    if require_reason and not reason:
+      raise ApiError(422, 'reason_required',
+                     'a valid reason is required when issuing an invite as Consul')
     if handle:
       handle = handle.lower()
       if not HANDLE_RE.match(handle) or handle in RESERVED_HANDLES:
@@ -71,11 +76,12 @@ class RegistryMixin:
     with self.db.tx() as c:
       cur = c.execute(
         'INSERT INTO invites(code_hash, display_name, handle, pool_id, target_principal_id, '
-        'created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'created_at, expires_at, issued_by_principal_id, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (security.token_hash(code), _clip(display_name, 64), handle, pool_id,
-         target_principal_id, now, now + self.settings.invite_ttl_sec),
+         target_principal_id, now, now + self.settings.invite_ttl_sec,
+         issued_by_principal_id, reason),
       )
-      self.events.append(c, 'invite', id=cur.lastrowid, action='created')
+      self.events.append(c, 'invite', id=cur.lastrowid, action='created', by=issued_by_principal_id)
     self.events.notify()
     return {'code': code, 'invite': self.invite_view(self.db.one(
       'SELECT * FROM invites WHERE id=?', (cur.lastrowid,)))}
@@ -102,15 +108,72 @@ class RegistryMixin:
       state = 'expired'
     else:
       state = 'open'
+    issuer = None
+    if r['issued_by_principal_id']:
+      ip = self.db.one('SELECT id, kind, handle, display_name FROM principals WHERE id=?',
+                       (r['issued_by_principal_id'],))
+      if ip:
+        issuer = {'id': ip['id'], 'kind': ip['kind'], 'handle': ip['handle'],
+                  'display_name': ip['display_name']}
     return {
       'id': r['id'], 'display_name': r['display_name'], 'handle': r['handle'],
       'pool_id': r['pool_id'], 'target_principal_id': r['target_principal_id'],
       'created_at': r['created_at'], 'expires_at': r['expires_at'], 'state': state,
       'redeemed_principal_id': r['redeemed_principal_id'],
+      'issued_by': issuer, 'reason': r['reason'],
     }
 
   def list_invites(self):
     rows = self.db.all('SELECT * FROM invites ORDER BY id DESC LIMIT 50')
+    return [self.invite_view(r) for r in rows]
+
+  # --- senate & consul -----------------------------------------------------
+
+  def consul_view(self):
+    row = self.db.one(
+      "SELECT * FROM principals WHERE kind='agent' AND status='admitted' AND role='consul' LIMIT 1"
+    )
+    return self.agent_view(row) if row else None
+
+  def appoint_consul(self, principal_id):
+    with self.db.tx() as c:
+      if principal_id is None:
+        c.execute("UPDATE principals SET role=NULL WHERE role='consul'")
+        self.events.append(c, 'principal', id=None, action='consul_dismissed')
+        row = None
+      else:
+        p = c.execute("SELECT * FROM principals WHERE id=? AND kind='agent'",
+                      (principal_id,)).fetchone()
+        if not p:
+          raise ApiError(404, 'no_principal', 'unknown agent')
+        if p['status'] != 'admitted':
+          raise ApiError(409, 'not_admitted', 'only an admitted agent may serve as Consul')
+        c.execute("UPDATE principals SET role=NULL WHERE role='consul'")
+        c.execute("UPDATE principals SET role='consul' WHERE id=?", (principal_id,))
+        self.events.append(c, 'principal', id=principal_id, action='consul_appointed')
+        row = c.execute('SELECT * FROM principals WHERE id=?', (principal_id,)).fetchone()
+    self.events.notify()
+    return {'consul': self.agent_view(row) if row else None}
+
+  def create_consul_invite(self, principal, data):
+    if principal['role'] != 'consul':
+      raise ApiError(403, 'consul_required', 'only the appointed Consul may create invites')
+    if data.get('target_principal_id') is not None:
+      raise ApiError(403, 'owner_required', 'only the Owner may re-admit a revoked agent')
+    return self.create_invite(
+      display_name=data.get('display_name'),
+      handle=data.get('handle'),
+      pool_id=data.get('pool_id'),
+      issued_by_principal_id=principal['id'],
+      reason=data.get('reason'),
+      require_reason=True,
+    )
+
+  def list_consul_invites(self, principal):
+    if principal['role'] != 'consul':
+      raise ApiError(403, 'consul_required', 'only the appointed Consul may view Consul invites')
+    rows = self.db.all('SELECT * FROM invites WHERE issued_by_principal_id=? ORDER BY id DESC LIMIT 50',
+                       (principal['id'],))
     return [self.invite_view(r) for r in rows]
 
   # --- join (invite redemption) --------------------------------------------
@@ -215,7 +278,8 @@ class RegistryMixin:
         raise ApiError(404, 'no_principal', 'unknown agent')
       if p['status'] != 'admitted':
         raise ApiError(409, 'not_admitted', 'agent is not admitted')
-      c.execute("UPDATE principals SET status='revoked', revoked_at=? WHERE id=?", (now, pid))
+      c.execute("UPDATE principals SET status='revoked', role=NULL, revoked_at=? WHERE id=?",
+                (now, pid))
       c.execute("UPDATE credentials SET status='revoked', revoked_at=? WHERE principal_id=? "
                 "AND status='active'", (now, pid))
       c.execute('UPDATE presence SET online=0 WHERE principal_id=?', (pid,))
@@ -348,6 +412,7 @@ class RegistryMixin:
       pres = self.presence_view(p['id']) if p['kind'] == 'agent' else None
       out.append({
         'handle': p['handle'], 'display_name': p['display_name'], 'kind': p['kind'],
+        'role': p['role'],
         'online': pres['online'] if pres else None,
         'modes': pres['modes'] if pres else ['queue'],
         'busy': (pres['status'] or {}).get('busy') if pres else None,

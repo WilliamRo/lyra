@@ -72,7 +72,7 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin):
                        (p['pool_id'],)) if p['pool_id'] else None
     counts = self.waiting_counts(p['id'])
     return {
-      'id': p['id'], 'kind': p['kind'], 'handle': p['handle'],
+      'id': p['id'], 'kind': p['kind'], 'handle': p['handle'], 'role': p['role'],
       'display_name': p['display_name'], 'address': p['address'], 'status': p['status'],
       'admitted_at': p['admitted_at'], 'revoked_at': p['revoked_at'],
       'pool': ({'id': pool['id'], 'provider': pool['provider'], 'label': pool['label'],
@@ -85,11 +85,14 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin):
     now = self.now()
     agents = self.db.all("SELECT * FROM principals WHERE kind='agent' ORDER BY status, display_name")
     owner = self.owner_principal()
+    all_invites = self.list_invites()
     return {
       'now': now, 'version': __version__,
       'owner': {'id': owner['id'], 'display_name': owner['display_name']} if owner else None,
+      'consul': self.consul_view(),
       'agents': [self.agent_view(p) for p in agents],
-      'invites': [i for i in self.list_invites() if i['state'] == 'open'],
+      'invites': [i for i in all_invites if i['state'] == 'open'],
+      'senate_invites': [i for i in all_invites if i.get('issued_by') and i['issued_by']['kind'] == 'agent'],
       'pools': [{'id': r['id'], 'provider': r['provider'], 'label': r['label'],
                  'reporter_principal_id': r['reporter_principal_id']}
                 for r in self.db.all('SELECT * FROM pools ORDER BY provider, label')],

@@ -11,7 +11,7 @@ import sqlite3
 import threading
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _schema_sql():
@@ -56,6 +56,20 @@ class Database:
       v = self._version()
       if v == 0:
         self.conn.executescript('BEGIN;' + _schema_sql() + 'COMMIT;')
+        self.conn.execute(
+          "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+          (str(SCHEMA_VERSION),),
+        )
+      elif v == 1:
+        self.conn.executescript(
+          'BEGIN;'
+          'ALTER TABLE principals ADD COLUMN role TEXT;'
+          "CREATE UNIQUE INDEX IF NOT EXISTS uq_principal_consul ON principals(role) "
+          "WHERE role = 'consul';"
+          'ALTER TABLE invites ADD COLUMN issued_by_principal_id INTEGER;'
+          'ALTER TABLE invites ADD COLUMN reason TEXT;'
+          'COMMIT;'
+        )
         self.conn.execute(
           "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
           (str(SCHEMA_VERSION),),

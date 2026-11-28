@@ -89,7 +89,29 @@ def h_invites(ctx):
 def h_invite_new(ctx):
   b = ctx.body()
   return ctx.app.create_invite(b.get('display_name'), b.get('handle'), _int(b.get('pool_id')),
-                               _int(b.get('target_principal_id')))
+                               _int(b.get('target_principal_id')),
+                               issued_by_principal_id=ctx.user['principal_id'],
+                               reason=b.get('reason'))
+
+
+@route('GET', r'/api/v1/senate', ADMIN)
+def h_senate_get(ctx):
+  return {
+    'consul': ctx.app.consul_view(),
+    'invites': [i for i in ctx.app.list_invites()
+                if i.get('issued_by') and i['issued_by']['kind'] == 'agent'],
+  }
+
+
+@route('POST', r'/api/v1/senate/consul', ADMIN)
+def h_senate_appoint(ctx):
+  b = ctx.body()
+  return ctx.app.appoint_consul(_int(b.get('principal_id')))
+
+
+@route('DELETE', r'/api/v1/senate/consul', ADMIN)
+def h_senate_dismiss(ctx):
+  return ctx.app.appoint_consul(None)
 
 
 @route('DELETE', r'/api/v1/admin/invites/(\d+)', ADMIN)
@@ -195,7 +217,26 @@ def h_checkin(ctx):
 def h_agent_me(ctx):
   p = ctx.principal
   return {'principal': {'id': p['id'], 'handle': p['handle'], 'display_name': p['display_name'],
-                        'address': p['address']}, 'presence': ctx.app.presence_view(p['id'])}
+                        'address': p['address'], 'role': p['role']},
+          'presence': ctx.app.presence_view(p['id'])}
+
+
+@route('GET', r'/api/v1/consul/invites', AGENT)
+def h_consul_invites(ctx):
+  return {'invites': ctx.app.list_consul_invites(ctx.principal)}
+
+
+@route('POST', r'/api/v1/consul/invites', AGENT)
+def h_consul_invite_new(ctx):
+  b = ctx.body()
+  payload = {
+    'display_name': b.get('display_name'),
+    'handle': b.get('handle'),
+    'pool_id': _int(b.get('pool_id')),
+    'target_principal_id': _int(b.get('target_principal_id')),
+    'reason': b.get('reason'),
+  }
+  return ctx.app.create_consul_invite(ctx.principal, payload)
 
 
 @route('GET', r'/api/v1/teammates', AGENT)

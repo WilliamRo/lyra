@@ -43,6 +43,7 @@ CREATE TABLE principals (
   display_name TEXT NOT NULL,
   address TEXT,
   status TEXT NOT NULL,            -- admitted | revoked
+  role TEXT,                       -- NULL | consul (single active holder)
   pool_id INTEGER,
   created_at REAL NOT NULL,
   admitted_at REAL,
@@ -52,6 +53,8 @@ CREATE UNIQUE INDEX uq_principal_active_address
   ON principals(address) WHERE status = 'admitted' AND address IS NOT NULL;
 CREATE UNIQUE INDEX uq_principal_active_handle
   ON principals(handle) WHERE status = 'admitted' AND handle IS NOT NULL;
+CREATE UNIQUE INDEX uq_principal_consul
+  ON principals(role) WHERE role = 'consul';
 
 -- Rotatable credentials; at most one active per principal.
 CREATE TABLE credentials (
@@ -78,7 +81,9 @@ CREATE TABLE invites (
   redeemed_at REAL,
   redeemed_principal_id INTEGER,
   client_key_hash TEXT,
-  cancelled_at REAL
+  cancelled_at REAL,
+  issued_by_principal_id INTEGER,
+  reason TEXT
 );
 
 CREATE TABLE presence (

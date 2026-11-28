@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -673,6 +674,162 @@ class SseAndBackupTests(ServerCase):
     self.assertIn("addEventListener('keydown'", js)
     self.assertIn('ev.isComposing', js)
     self.assertIn('requestSubmit()', js)
+    self.assertIn('/api/v1/senate/consul', js)
+
+
+# =============================================================================
+# Senate and single-Consul authority
+# =============================================================================
+
+class SenateAndConsulTests(ServerCase):
+
+  def test_senate_tab_placed_right_of_admin(self):
+    with urllib.request.urlopen(f'{self.base}/') as resp:
+      html = resp.read().decode('utf-8')
+    admin_pos = html.find('data-tab="admin"')
+    senate_pos = html.find('data-tab="senate"')
+    self.assertGreater(admin_pos, 0)
+    self.assertGreater(senate_pos, admin_pos)
+    self.assertIn('Appoint Consul', html)
+    self.assertIn('Dismiss Consul', html)
+
+  def test_single_consul_lifecycle_and_invite_authority(self):
+    o = self.owner()
+    a = self.agent(o, 'gem')
+    b = self.agent(o, 'dario')
+
+    # 1. Initially no Consul; non-Consul cannot issue Consul invites; agents cannot appoint.
+    st, sen = o.call('GET', '/api/v1/senate')
+    self.assertEqual((st, sen['consul']), (200, None))
+    st, r = a.call('POST', '/api/v1/consul/invites', {'handle': 'boris', 'reason': 'onboard'})
+    self.assertEqual((st, r['error']), (403, 'consul_required'))
+    st, _ = a.call('POST', '/api/v1/senate/consul', {'principal_id': a.pid})
+    self.assertEqual(st, 401)
+
+    # 2. Owner appoints A as Consul.
+    st, ap = o.call('POST', '/api/v1/senate/consul', {'principal_id': a.pid})
+    self.assertEqual(st, 200)
+    self.assertEqual((ap['consul']['id'], ap['consul']['role']), (a.pid, 'consul'))
+    st, me = a.call('GET', '/api/v1/me')
+    self.assertEqual((st, me['principal']['role']), (200, 'consul'))
+    st, mates = b.call('GET', '/api/v1/teammates')
+    self.assertEqual(next(t for t in mates['teammates'] if t['handle'] == 'gem')['role'], 'consul')
+
+    # 3. Consul invite requires a reason and forbids re-admitting revoked agents directly.
+    st, r = a.call('POST', '/api/v1/consul/invites', {'handle': 'boris'})
+    self.assertEqual((st, r['error']), (422, 'reason_required'))
+    st, r = a.call('POST', '/api/v1/consul/invites',
+                   {'target_principal_id': 99, 'reason': 're-admit'})
+    self.assertEqual((st, r['error']), (403, 'owner_required'))
+
+    # 4. Consul issues an invite with valid justification; new agent redeems it.
+    st, inv = a.call('POST', '/api/v1/consul/invites', {
+      'handle': 'boris',
+      'display_name': 'Boris',
+      'reason': 'Requested by @dario for parallel MiniMAC coding duties',
+    })
+    self.assertEqual(st, 200, inv)
+    self.assertEqual(inv['invite']['issued_by']['handle'], 'gem')
+    self.assertIn('parallel MiniMAC', inv['invite']['reason'])
+    st, mine = a.call('GET', '/api/v1/consul/invites')
+    self.assertEqual((st, len(mine['invites'])), (200, 1))
+
+    c = Client(self.base, origin=False)
+    st, joined = c.call('POST', '/api/v1/join', {
+      'invite_code': inv['code'], 'client_key': 'boris-client-key-123456', 'handle': 'boris',
+    })
+    self.assertEqual(st, 200, joined)
+    st, board = o.call('GET', '/api/v1/board')
+    self.assertEqual(board['consul']['handle'], 'gem')
+    self.assertEqual(len(board['senate_invites']), 1)
+    self.assertEqual(board['senate_invites'][0]['state'], 'redeemed')
+
+    # 5. Appointing B atomically replaces A as sole Consul.
+    st, ap2 = o.call('POST', '/api/v1/senate/consul', {'principal_id': b.pid})
+    self.assertEqual((st, ap2['consul']['handle']), (200, 'dario'))
+    st, r = a.call('POST', '/api/v1/consul/invites', {'handle': 'kimi', 'reason': 'late request'})
+    self.assertEqual((st, r['error']), (403, 'consul_required'))
+    st, b_ok = b.call('POST', '/api/v1/consul/invites', {'handle': 'kimi', 'reason': 'valid need'})
+    self.assertEqual(st, 200, b_ok)
+
+    # 6. Revoking Consul clears role; appointing dismissed works cleanly.
+    self.assertEqual(o.call('POST', f'/api/v1/admin/principals/{b.pid}/revoke', {})[0], 200)
+    self.assertIsNone(o.call('GET', '/api/v1/senate')[1]['consul'])
+    self.assertEqual(o.call('POST', '/api/v1/senate/consul', {'principal_id': a.pid})[0], 200)
+    st, dis = o.call('DELETE', '/api/v1/senate/consul')
+    self.assertEqual((st, dis['consul']), (200, None))
+    self.assertEqual(a.call('POST', '/api/v1/consul/invites',
+                            {'handle': 'x1', 'reason': 'after dismissal'})[0], 403)
+
+  def test_schema_v1_to_v2_migration_preserves_existing_data(self):
+    from lyra_server.db import Database, SCHEMA_VERSION
+    d = tmpdir()
+    db_path = Path(d) / 'v1.sqlite'
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'admin',
+        status TEXT NOT NULL DEFAULT 'active', principal_id INTEGER NOT NULL, created_at REAL NOT NULL);
+      CREATE TABLE web_sessions (id_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+        persistent INTEGER NOT NULL, created_at REAL NOT NULL, last_seen_at REAL NOT NULL,
+        expires_at REAL NOT NULL);
+      CREATE TABLE pools (id INTEGER PRIMARY KEY, provider TEXT NOT NULL, label TEXT NOT NULL,
+        reporter_principal_id INTEGER, usage TEXT, reported_at REAL, created_at REAL NOT NULL);
+      CREATE TABLE principals (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, handle TEXT,
+        display_name TEXT NOT NULL, address TEXT, status TEXT NOT NULL, pool_id INTEGER,
+        created_at REAL NOT NULL, admitted_at REAL, revoked_at REAL);
+      CREATE TABLE credentials (id INTEGER PRIMARY KEY, principal_id INTEGER NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE, invite_id INTEGER, status TEXT NOT NULL,
+        created_at REAL NOT NULL, revoked_at REAL);
+      CREATE TABLE invites (id INTEGER PRIMARY KEY, code_hash TEXT NOT NULL UNIQUE,
+        display_name TEXT, handle TEXT, pool_id INTEGER, target_principal_id INTEGER,
+        created_at REAL NOT NULL, expires_at REAL NOT NULL, redeemed_at REAL,
+        redeemed_principal_id INTEGER, client_key_hash TEXT, cancelled_at REAL);
+      CREATE TABLE presence (principal_id INTEGER PRIMARY KEY, instance_id TEXT, host TEXT,
+        provider TEXT, runtime TEXT, connector TEXT, modes TEXT, status TEXT,
+        last_checkin_at REAL, online INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE conversations (id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+        dm_pair_key TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);
+      CREATE TABLE conversation_members (conversation_id INTEGER NOT NULL,
+        principal_id INTEGER NOT NULL, PRIMARY KEY (conversation_id, principal_id));
+      CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL,
+        sender_id INTEGER NOT NULL, recipient_id INTEGER NOT NULL, body TEXT NOT NULL,
+        reply_to_id INTEGER, mode TEXT NOT NULL, priority INTEGER NOT NULL,
+        state TEXT NOT NULL, state_reason TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+        retry INTEGER NOT NULL DEFAULT 0, lease_id TEXT, lease_until REAL,
+        client_msg_id TEXT, created_at REAL NOT NULL, delivered_at REAL, failed_at REAL);
+      CREATE TABLE delivery_attempts (id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL,
+        lease_id TEXT NOT NULL UNIQUE, claimed_at REAL NOT NULL, lease_until REAL NOT NULL,
+        outcome TEXT, outcome_at REAL);
+      CREATE TABLE reactions (message_id INTEGER NOT NULL, reactor_id INTEGER NOT NULL,
+        emoji TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY (message_id, reactor_id, emoji));
+      CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+        type TEXT NOT NULL, payload TEXT NOT NULL);
+      INSERT INTO meta VALUES ('schema_version', '1');
+      INSERT INTO principals(id, kind, handle, display_name, status, created_at, admitted_at)
+        VALUES (1, 'owner', 'owner', 'William', 'admitted', 1.0, 1.0),
+               (2, 'agent', 'gem', 'Gem', 'admitted', 1.0, 1.0);
+    """)
+    conn.commit()
+    conn.close()
+
+    db = Database(db_path)
+    try:
+      ver = db.one("SELECT value FROM meta WHERE key='schema_version'")[0]
+      self.assertEqual(int(ver), SCHEMA_VERSION)
+      gem = db.one("SELECT handle, role FROM principals WHERE id=2")
+      self.assertEqual((gem['handle'], gem['role']), ('gem', None))
+      with db.tx() as c:
+        c.execute("UPDATE principals SET role='consul' WHERE id=2")
+        c.execute("INSERT INTO invites(code_hash, handle, created_at, expires_at, issued_by_principal_id, reason) "
+                  "VALUES ('h1', 'boris', 1.0, 99.0, 2, 'migrated test')")
+      with self.assertRaises(sqlite3.IntegrityError):
+        with db.tx() as c:
+          c.execute("UPDATE principals SET role='consul' WHERE id=1")
+    finally:
+      db.close()
+      shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == '__main__':

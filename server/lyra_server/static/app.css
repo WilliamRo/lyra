@@ -65,6 +65,7 @@ label.check input { width: auto; }
   border: 1px solid var(--line); color: var(--muted); }
 .pill.busy { color: var(--warn); border-color: var(--warn); }
 .pill.idle { color: var(--ok); border-color: var(--ok); }
+.pill.consul { color: var(--accent); border-color: var(--accent); font-weight: 600; }
 .group-label { margin: .8rem 0 .4rem; font-size: .8rem; text-transform: uppercase;
   letter-spacing: .04em; color: var(--muted); }
 

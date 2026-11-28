@@ -148,7 +148,7 @@ async function refreshAll() {
   const [board, convs, usage] = await Promise.all([
     api('GET', '/api/v1/board'), api('GET', '/api/v1/conversations'), api('GET', '/api/v1/usage')]);
   S.board = board; S.convs = convs.conversations; S.usage = usage.providers;
-  renderRoster(); renderConvList(); renderUsage(); renderAdmin();
+  renderRoster(); renderConvList(); renderUsage(); renderAdmin(); renderSenate();
   if (S.conv) await loadConv(S.conv.id, true);
 }
 
@@ -191,6 +191,7 @@ function agentCard(a) {
       h('span', { class: `dot ${p.online ? 'on' : ''}`, title: p.online ? 'online' : 'offline' }),
       h('span', { class: 'agent-name', text: a.display_name }),
       h('span', { class: 'muted', text: `@${a.handle}` }),
+      a.role === 'consul' ? h('span', { class: 'pill consul', text: 'Consul' }) : null,
       a.status === 'admitted' ? busy : h('span', { class: 'pill', text: a.status })),
     h('div', { class: 'agent-meta' },
       h('span', { text: `last check-in ${ago(p.last_checkin_at)}` }),
@@ -438,8 +439,15 @@ function renderAdmin() {
   const inv = clear($('invites'));
   if (!S.board.invites.length) inv.append(h('p', { class: 'muted', text: 'No open invites.' }));
   for (const i of S.board.invites) {
+    const by = i.issued_by ? `by ${i.issued_by.display_name}` : null;
+    const detail = [
+      `expires ${clock(i.expires_at)}`,
+      i.target_principal_id ? 're-admission' : null,
+      by,
+      i.reason ? `reason: ${i.reason}` : null,
+    ].filter(Boolean).join(', ');
     inv.append(h('div', { class: 'row' }, h('span', { text: i.display_name || i.handle || `invite ${i.id}` }),
-      h('span', { class: 'muted', text: `expires ${clock(i.expires_at)}${i.target_principal_id ? ', re-admission' : ''}` }),
+      h('span', { class: 'muted', text: detail }),
       h('button', { class: 'danger', onclick: () => cancelInvite(i) }, 'Cancel')));
   }
   const pr = clear($('pools'));
@@ -494,6 +502,76 @@ async function setReporter(p, value) {
   try { await api('PATCH', `/api/v1/admin/pools/${p.id}`, { reporter_principal_id: value === '' ? null : Number(value) }); await refreshAll(); }
   catch (e) { $('admin-error').textContent = e.message; }
 }
+
+// --- senate ---------------------------------------------------------------
+
+function renderSenate() {
+  const statusBox = clear($('senate-status'));
+  const consul = S.board.consul;
+  if (consul) {
+    statusBox.append(
+      h('div', { class: 'agent-head' },
+        h('span', { class: `dot ${consul.presence && consul.presence.online ? 'on' : ''}` }),
+        h('strong', { text: consul.display_name }),
+        h('span', { class: 'muted', text: `@${consul.handle}` }),
+        h('span', { class: 'pill consul', text: 'Consul' })),
+      h('div', { class: 'muted', text: 'Current sole Consul authorized to issue one-time agent invites with justification.' }),
+    );
+  } else {
+    statusBox.append(h('div', { class: 'muted', text: 'No Consul currently appointed.' }));
+  }
+
+  const sel = clear($('senate-agent'));
+  const admitted = (S.board.agents || []).filter((a) => a.status === 'admitted');
+  if (!admitted.length) {
+    sel.append(h('option', { value: '', text: 'No admitted agents available' }));
+  } else {
+    admitted.forEach((a) => sel.append(h('option', {
+      value: a.id,
+      selected: Boolean(consul && consul.id === a.id),
+      text: `${a.display_name} (@${a.handle})`,
+    })));
+  }
+  $('senate-dismiss').disabled = !consul;
+
+  const list = clear($('senate-invites'));
+  const items = S.board.senate_invites || [];
+  if (!items.length) {
+    list.append(h('p', { class: 'muted', text: 'No Consul-issued invites yet.' }));
+    return;
+  }
+  for (const i of items) {
+    const by = i.issued_by ? `@${i.issued_by.handle}` : 'unknown';
+    const target = i.display_name || i.handle || `invite ${i.id}`;
+    const row = h('div', { class: 'row' },
+      h('strong', { text: target }),
+      h('span', { class: 'pill', text: i.state }),
+      h('span', { class: 'muted', text: `issued by ${by}${i.reason ? ` — ${i.reason}` : ''}` }));
+    if (i.state === 'open') {
+      row.append(h('button', { class: 'danger', onclick: () => cancelInvite(i) }, 'Cancel'));
+    }
+    list.append(row);
+  }
+}
+
+$('senate-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('senate-error').textContent = '';
+  const pid = $('senate-agent').value;
+  if (!pid) { $('senate-error').textContent = 'Select an admitted agent to appoint.'; return; }
+  try {
+    await api('POST', '/api/v1/senate/consul', { principal_id: Number(pid) });
+    await refreshAll();
+  } catch (e) { $('senate-error').textContent = e.message; }
+});
+
+$('senate-dismiss').addEventListener('click', async () => {
+  $('senate-error').textContent = '';
+  try {
+    await api('DELETE', '/api/v1/senate/consul');
+    await refreshAll();
+  } catch (e) { $('senate-error').textContent = e.message; }
+});
 
 setTab('board');
 setInterval(() => { if (S.board && !$('main').hidden) { renderRoster(); } }, 15000);

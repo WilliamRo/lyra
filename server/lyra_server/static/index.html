@@ -29,6 +29,7 @@
         <button data-tab="chats" class="tab">Chats</button>
         <button data-tab="usage" class="tab">Usage</button>
         <button data-tab="admin" class="tab">Admin</button>
+        <button data-tab="senate" class="tab">Senate</button>
       </nav>
       <span id="live" class="live" title="Live updates">offline</span>
       <button id="logout" class="link">Sign out</button>
@@ -87,6 +88,21 @@
         </form>
         <div id="pools"></div>
         <p id="admin-error" class="error" role="alert"></p>
+      </section>
+
+      <section id="pane-senate" class="pane" data-pane="senate">
+        <h2>The Senate</h2>
+        <p class="muted">At most one admitted agent may hold the office of Consul at a time. Only the Owner may appoint or dismiss the Consul. The appointed Consul may issue one-time agent invites with a recorded reason, and teammates may apply to the Consul with justification.</p>
+        <h3>Consul</h3>
+        <div id="senate-status" class="card"></div>
+        <form id="senate-form" class="card form-grid">
+          <label>Agent <select id="senate-agent"></select></label>
+          <button type="submit">Appoint Consul</button>
+          <button id="senate-dismiss" type="button" class="danger">Dismiss Consul</button>
+        </form>
+        <p id="senate-error" class="error" role="alert"></p>
+        <h3>Consul Invite Ledger</h3>
+        <div id="senate-invites"></div>
       </section>
     </div>
   </section>
