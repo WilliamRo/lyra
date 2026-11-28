@@ -3,11 +3,14 @@
 # Run: python3 -B -m unittest discover -s server/tests -t server
 # =============================================================================
 
+import ast
+import fnmatch
 import hashlib
 import http.cookiejar
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import sys
@@ -840,10 +843,29 @@ class StageOneTests(ServerCase):
         self.assertEqual(response.read(), (ROOT / 'lyra_server/static/vendor/katex' / name).read_bytes())
     with urllib.request.urlopen(self.base + '/static/app.js') as response:
       self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+    with urllib.request.urlopen(self.base + '/static/favicon.svg') as response:
+      self.assertEqual(response.headers.get_content_type(), 'image/svg+xml')
+      self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+      self.assertEqual(response.read(), (ROOT / 'lyra_server/static/favicon.svg').read_bytes())
     for name in ('', '/app.js', 'vendor//katex', '.private', 'vendor/%2e%2e/app.js', 'vendor%5ckatex'):
       with self.assertRaises(urllib.error.HTTPError) as caught:
         urllib.request.urlopen(self.base + '/static/' + name)
       self.assertEqual(caught.exception.code, 404)
+
+  def test_pyproject_package_data_covers_all_static_files(self):
+    text = (ROOT / 'pyproject.toml').read_text(encoding='utf-8')
+    m = re.search(r'"lyra_server\.static"\s*=\s*(\[[^\]]+\])', text)
+    self.assertIsNotNone(m)
+    patterns = ast.literal_eval(m.group(1))
+    static_root = ROOT / 'lyra_server/static'
+    uncovered = []
+    for p in sorted(static_root.rglob('*')):
+      if not p.is_file() or '__pycache__' in p.parts or p.suffix == '.py':
+        continue
+      rel_parts = p.relative_to(static_root).parts
+      if not any(len(rel_parts) == len(pat.split('/')) and all(fnmatch.fnmatchcase(s, g) for s, g in zip(rel_parts, pat.split('/'))) for pat in patterns):
+        uncovered.append(p.relative_to(static_root).as_posix())
+    self.assertEqual(uncovered, [])
 
   def test_effective_status_progress_staleness_and_sweeper(self):
     o = self.owner()
