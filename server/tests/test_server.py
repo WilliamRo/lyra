@@ -1391,6 +1391,42 @@ class SenateAndConsulTests(ServerCase):
       db.close()
       shutil.rmtree(d, ignore_errors=True)
 
+  def test_board_snapshot_and_last_event_id_are_atomic(self):
+    # A concurrent mutation mid-board() must either appear in the returned snapshot or follow its last_event_id.
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix='lyra-atomic-board-'))
+    from lyra_server.config import Settings
+    from lyra_server.core import Lyra
+    app = Lyra(Settings(data_dir=str(d)))
+    try:
+      inv = app.create_invite(display_name='Gem', handle='gem')
+      joined = app.join({'invite_code': inv['code'], 'client_key': 'atomic-board-test-client-key-01', 'handle': 'gem',
+                         'display_name': 'Gem', 'host': 'host-a'})
+      agent_row = app.db.one('SELECT * FROM principals WHERE id=?', (joined['principal']['id'],))
+      app.checkin(agent_row, {'instance_id': 'inst-1', 'host': 'host-a'})
+
+      orig_projects = app.projects_view
+      writer_done = threading.Event()
+      t = threading.Thread(target=lambda: (app.set_host_alias('host-a', 'RenamedHost'), writer_done.set()), daemon=True)
+
+      def hooked_projects():
+        if not t.is_alive() and not writer_done.is_set():
+          t.start()
+          writer_done.wait(timeout=0.05)
+        return orig_projects()
+
+      app.projects_view = hooked_projects
+      b = app.board()
+      t.join(timeout=2)
+      host_entry = next(h for h in b['hosts'] if h['host'] == 'host-a')
+      if host_entry['display_name'] != 'RenamedHost':
+        replay = app.events.since(b['last_event_id'])
+        self.assertTrue(any(ev['type'] == 'host' and ev['payload'].get('host') == 'host-a' for ev in replay),
+                        f'stale board paired with post-mutation cursor {b["last_event_id"]}')
+    finally:
+      app.db.close()
+      shutil.rmtree(d, ignore_errors=True)
+
 
 if __name__ == '__main__':
   unittest.main()

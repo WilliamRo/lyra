@@ -181,12 +181,19 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin, Projec
     return {'cleaned': cleaned, 'storage': self.storage_view()}
 
   def board(self):
-    now = self.now()
-    agents = self.db.all("SELECT * FROM principals WHERE kind='agent' ORDER BY status, display_name")
-    owner = self.owner_principal()
-    all_invites = self.list_invites()
-    aliases = {r['host']: r['display_name'] for r in self.db.all('SELECT host, display_name FROM host_aliases')}
-    agents = [self.agent_view(p) for p in agents]
+    # Hold db.lock across every snapshot query and latest_id() so concurrent mutations
+    # cannot update last_event_id after stale rows were read.
+    with self.db.lock:
+      now = self.now()
+      agents = self.db.all("SELECT * FROM principals WHERE kind='agent' ORDER BY status, display_name")
+      owner = self.owner_principal()
+      all_invites = self.list_invites()
+      aliases = {r['host']: r['display_name'] for r in self.db.all('SELECT host, display_name FROM host_aliases')}
+      agents = [self.agent_view(p) for p in agents]
+      consul = self.consul_view()
+      projects = self.projects_view()
+      pools = [pool for provider in self.usage_view() for pool in provider['pools']]
+      last_event_id = self.events.latest_id()
     hosts = {}
     for agent in agents:
       presence = agent['presence']
@@ -206,11 +213,11 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin, Projec
     return {
       'now': now, 'version': __version__,
       'owner': {'id': owner['id'], 'display_name': owner['display_name'], 'avatar': loads(owner['avatar'])} if owner else None,
-      'consul': self.consul_view(),
-      'agents': agents, 'hosts': [hosts[key] for key in sorted(hosts)], 'projects': self.projects_view(),
+      'consul': consul,
+      'agents': agents, 'hosts': [hosts[key] for key in sorted(hosts)], 'projects': projects,
       'invites': [i for i in all_invites if i['state'] == 'open'],
       'senate_invites': [i for i in all_invites if i.get('issued_by') and i['issued_by']['kind'] == 'agent'],
-      'pools': [pool for provider in self.usage_view() for pool in provider['pools']],
+      'pools': pools,
       'server_storage': self.storage_view(),
       'settings': {'max_attachment_bytes': self.settings.max_attachment_bytes,
                    'max_attachments_per_message': self.settings.max_attachments_per_message,
@@ -220,5 +227,5 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin, Projec
                    'storage_quota_gb': self.settings.storage_quota_gb,
                    'message_ttl_sec': self.settings.message_ttl_sec,
                    'invite_ttl_sec': self.settings.invite_ttl_sec},
-      'last_event_id': self.events.latest_id(),
+      'last_event_id': last_event_id,
     }
