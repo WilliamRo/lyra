@@ -19,6 +19,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import zlib
@@ -165,6 +166,13 @@ class SeededBoard:
     pb = o.call('POST', '/api/v1/admin/pools', {'provider': 'anthropic', 'label': 'Claude Pro', 'account_label': 'Personal',
                                                'subscription': 'Pro'})['id']
     pc = o.call('POST', '/api/v1/admin/pools', {'provider': 'openai', 'label': 'Codex team', 'subscription': 'Team'})['id']
+    # A long label repeated as account and plan (owner screenshot #131): shown once, never overflowing.
+    pg = o.call('POST', '/api/v1/admin/pools', {'provider': 'google', 'label': 'Google AI Ultra (MiniMAC)',
+                                               'account_label': 'Google AI Ultra (MiniMAC)',
+                                               'subscription': 'Google AI Ultra (MiniMAC)'})['id']
+    pk = o.call('POST', '/api/v1/admin/pools', {'provider': 'moonshot', 'label': 'Kimi Coding', 'account_label': 'Moonshot console',
+                                               'subscription': 'Allegretto'})['id']
+    t0 = time.time()
     mac = {'os': 'macOS 26.2', 'arch': 'arm64', 'ip': '192.168.0.108', 'cpu_count': 10, 'mem_total_gb': 32,
            'mem_used_gb': 18.4, 'mem_used_pct': 57.5, 'disk_total_gb': 1800, 'disk_free_gb': 412, 'disk_used_pct': 77.1,
            'uptime_sec': 432100}
@@ -175,10 +183,19 @@ class SeededBoard:
               status={'model': 'Opus 5.5', 'effort': 'high', 'context_pct': 41, 'busy': False})
     self.join('claude', 'Claude', 'mac-mini.local', 'anthropic', pool=pb, metrics=mac,
               status={'model': 'Opus 5.5', 'effort': 'medium', 'context_pct': 12, 'busy': False})
-    self.join('gem', 'Gem', 'studio-linux', 'google', metrics=lin,
+    self.join('gem', 'Gem', 'studio-linux', 'google', pool=pg, metrics=lin,
               status={'model': 'Gemini 3 Pro', 'context_pct': 63, 'busy': True})
-    self.join('echo', 'Echo', 'studio-linux', 'google', metrics=lin, status={'model': 'echo', 'busy': False})
+    # Echo is busy but its last activity is 15 minutes old: the server derives "stalled".
+    self.join('echo', 'Echo', 'studio-linux', 'google', metrics=lin, status={'model': 'echo', 'busy': True, 'activity': {
+              'state': 'busy', 'since': t0 - 1500, 'last_activity_at': t0 - 900, 'turn_started_at': t0 - 1500}})
+    box = {'os': 'Debian 13', 'arch': 'x86_64', 'ip': '10.0.0.40', 'cpu_count': 16, 'mem_total_gb': 64, 'mem_used_gb': 22.5,
+           'mem_used_pct': 35.2, 'disk_total_gb': 1858, 'disk_free_gb': 1366, 'disk_used_pct': 26.5, 'uptime_sec': 86400 * 2}
+    self.join('kimi', 'Kimi', 'build-box', 'moonshot', pool=pk, metrics=box,
+              status={'model': 'Kimi K3', 'effort': 'high', 'context_pct': 86, 'busy': False})
     self.join('codex', 'Codex', 'build-box', 'openai', pool=pc, checkin=False)
+    o.call('PATCH', f"/api/v1/admin/principals/{self.ids['gem']}", {'avatar': {'image': '/static/avatars/gem.png', 'icon': 'gem'}})
+    o.call('PATCH', f"/api/v1/admin/principals/{self.ids['kimi']}", {'avatar': {'image': '/static/avatars/kimi.png'}})
+    o.call('PUT', '/api/v1/admin/hosts/mac-mini.local', {'display_name': 'Malaysia Mac mini'})
     old = self.join('old', 'Old helper', 'mac-mini.local', 'anthropic', checkin=False)
     o.call('POST', f'/api/v1/admin/principals/{old.pid}/revoke', {})
     o.call('PATCH', f'/api/v1/admin/pools/{pa}', {'reporter_principal_id': self.ids['dario']})
@@ -192,7 +209,8 @@ class SeededBoard:
     o.call('POST', '/api/v1/senate/consul', {'principal_id': self.ids['gem']})
 
     # Owner and Dario: delivered, working progress, rich reply with an image.
-    ask = o.call('POST', '/api/v1/messages', {'to': self.ids['dario'], 'body': 'Please audit the **static routes** and report blockers.'})['message']
+    ask = o.call('POST', '/api/v1/messages', {'to': self.ids['dario'], 'body': 'Please audit the **static routes** and report blockers.',
+                                              'client_sent_at': time.time() - 0.05})['message']
     self.deliver('dario')
     d = self.agents['dario']
     d.call('PUT', f"/api/v1/messages/{ask['id']}/progress", {'phase': 'working', 'summary': 'Auditing REST routes and CSP headers',
@@ -206,7 +224,8 @@ class SeededBoard:
       'Expected load is $\\mathbb{E}[x_t] = \\alpha + \\beta_i$:', '$$\\sum_{i=1}^{n} x_i^2 \\le n \\max_i x_i^2$$',
       '```python', 'def is_safe(part):', "    return part not in ('', '.', '..')", '```'])
     d.call('POST', f"/api/v1/messages/{ask['id']}/reply", {'body': reply, 'attachment_ids': [att['id']]})
-    follow = o.call('POST', '/api/v1/messages', {'to': self.ids['dario'], 'body': 'Thanks. Next: wire the board and post screenshots.'})['message']
+    follow = o.call('POST', '/api/v1/messages', {'to': self.ids['dario'], 'body': 'Thanks. Next: wire the board and post screenshots.',
+                                                 'client_sent_at': time.time() - 0.02})['message']
     self.deliver('dario')
     d.call('PUT', f"/api/v1/messages/{follow['id']}/progress", {'phase': 'working', 'summary': 'Wiring the v2 board',
            'bullets': [{'text': 'Rebase on upstream', 'state': 'done'}, {'text': 'Wire modules', 'state': 'done'},
@@ -218,8 +237,22 @@ class SeededBoard:
     self.deliver('dario')
     # Owner and Claude: queued (never claimed), unread agent note first.
     self.agents['claude'].call('POST', '/api/v1/messages', {'to': 'owner', 'body': 'Ready when you are. Quota is low on my pool.'})
-    o.call('POST', '/api/v1/messages', {'to': self.ids['claude'], 'body': 'Hold on, I will queue two tasks.', 'mode': 'queue'})
+    o.call('POST', '/api/v1/messages', {'to': self.ids['claude'], 'body': 'Hold on, I will queue two tasks.', 'mode': 'queue',
+                                        'client_sent_at': time.time() - 0.04})
     o.call('POST', '/api/v1/messages', {'to': self.ids['claude'], 'body': 'Urgent: check the CI run first.', 'mode': 'jump'})
+    dropped = o.call('POST', '/api/v1/messages', {'to': self.ids['claude'], 'body': 'Never mind the lint pass.'})['message']
+    o.call('POST', f"/api/v1/messages/{dropped['id']}/cancel", {'reason': 'changed my mind'})
+    # Claude's delivery is held: messages wait on the server until the owner resumes it.
+    o.call('POST', f"/api/v1/admin/principals/{self.ids['claude']}/hold", {'reason': 'quota nearly used up'})
+    # Kimi needs the owner's input; Codex is offline with mail waiting.
+    k = o.call('POST', '/api/v1/messages', {'to': self.ids['kimi'], 'body': 'Run the ablation on the new dataset.',
+                                            'client_sent_at': time.time() - 0.03})['message']
+    self.deliver('kimi')
+    self.agents['kimi'].call('PUT', f"/api/v1/messages/{k['id']}/progress", {'phase': 'input_required',
+                             'summary': 'Which dataset split should I use for the ablation?'})
+    o.call('POST', '/api/v1/messages', {'to': self.ids['codex'], 'body': 'Please rebase the release branch when you are back.'})
+    # An upload never attached to a message: counted as an orphan in Server Storage.
+    o.call('POST', '/api/v1/attachments', raw=png_bytes(64, 40), headers={'X-Filename': 'orphan.png'})
     # Owner and Gem (Consul): thinking.
     g = o.call('POST', '/api/v1/messages', {'to': self.ids['gem'], 'body': 'As Consul, please review the invite ledger.'})['message']
     self.deliver('gem')
@@ -245,9 +278,12 @@ class SeededBoard:
         ('KaTeX font MIME types', 'in_review', 1, ['claude']),
         ('CSP style-src-attr', 'in_progress', 3, ['dario', 'gem']),
         ('Load test on studio-linux', 'blocked', 1, ['gem']),
-        ('Write QA checklist', 'open', 0, ['claude'])]:
-      o.call('POST', f"/api/v1/projects/{proj['id']}/tasks", {'title': title, 'status': status, 'priority': prio,
-                                                              'assignee_ids': [self.ids[x] for x in who]})
+        ('Write QA checklist', 'open', 0, ['claude']),
+        ('Port the legacy migration script', 'cancelled', 0, ['dario'])]:
+      body = {'title': title, 'status': status, 'priority': prio, 'assignee_ids': [self.ids[x] for x in who]}
+      if status == 'blocked':
+        body['blocked_reason'] = 'Waiting for the GPU node to come back online'
+      o.call('POST', f"/api/v1/projects/{proj['id']}/tasks", body)
     self.project_id = proj['id']
     o.call('POST', '/api/v1/projects', {'name': 'Lecture notes v2', 'description': 'Course materials refresh.',
                                         'pm_principal_id': self.ids['gem'], 'member_ids': [self.ids['gem']]})
@@ -258,7 +294,7 @@ class SeededBoard:
 # Test-only proxy
 # =============================================================================
 
-QA_FILES = {'probe.js': 'text/javascript'}
+QA_FILES = {'probe.js': 'text/javascript', 'favicon.html': 'text/html', 'favicon.css': 'text/css'}
 
 
 class _ProxyHandler(BaseHTTPRequestHandler):

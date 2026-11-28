@@ -6,6 +6,7 @@
   var S = g.LyraStore;
   var A = g.LyraAvatar;
   var L = g.LyraLifecycle;
+  var B = g.LyraBrand;
 
   function types(blocks) { return blocks.map(function (b) { return b.type; }); }
   function inl(s) { return M.parseInline(s); }
@@ -188,7 +189,9 @@
     assert.eq(v.activeTab, 'chats');
     assert.eq(v.agentGroupMode, 'machine');
     assert.deep(v.expandedAgentIds, [2]);
-    assert.eq(S.sanitizeView({ activeTab: 'senate' }).activeTab, 'admin-senate');
+    assert.eq(S.sanitizeView({ activeTab: 'admin-senate' }).activeTab, 'senate', 'Stage 2 tab name maps to Senate');
+    assert.eq(S.sanitizeView({ activeTab: 'admin' }).activeTab, 'senate');
+    assert.eq(S.sanitizeView({ activeTab: 'senate' }).activeTab, 'senate');
     assert.eq(S.sanitizeView({ activeTab: 'agents' }, { desktop: true }).activeTab, 'chats');
     assert.eq(S.sanitizeView({ activeTab: 'agents' }, { desktop: false }).activeTab, 'agents');
     var sel = S.sanitizeView({ selectedConvId: 9, pendingAgentId: 3, mobileChatView: 'thread' },
@@ -216,7 +219,7 @@
     assert.eq(a, 'lyra.ui.v2.draft.conv:4');
     assert.eq(p, 'lyra.ui.v2.draft.pending:7');
     s.drafts.save(a, { text: 'line 1\nline 2', replyToId: 42, mode: 'jump' });
-    assert.deep(s.drafts.load(a), { text: 'line 1\nline 2', replyToId: 42, mode: 'jump', updatedAt: 1795868193 });
+    assert.deep(s.drafts.load(a), { text: 'line 1\nline 2', replyToId: 42, mode: 'jump', attachments: [], updatedAt: 1795868193 });
     s.drafts.save(a, { text: '', replyToId: 42 });
     assert.eq(s.drafts.load(a).replyToId, 42, 'a reply target alone keeps the draft');
     s.drafts.save(a, { text: '' });
@@ -226,6 +229,30 @@
     assert.eq(s.drafts.load(p), null);
     mem.setItem('lyra.ui.v2.draft.conv:5', '{not json');
     assert.eq(s.drafts.load('lyra.ui.v2.draft.conv:5'), null);
+  });
+
+  test('store: theme, sidebar, notifications and mutes', function () {
+    var v = S.sanitizeView({ theme: 'dark', sidebarCollapsed: true, sidebarWidth: 9999, notify: true,
+                             mutedAgentIds: [3, 4, 4] }, { agentIds: [3] });
+    assert.eq(v.theme, 'dark'); assert.eq(v.sidebarCollapsed, true); assert.eq(v.sidebarWidth, S.SIDEBAR.max);
+    assert.eq(v.notify, true); assert.deep(v.mutedAgentIds, [3]);
+    var d = S.sanitizeView({ theme: 'sepia', sidebarCollapsed: 'yes', sidebarWidth: 10, notify: 1 });
+    assert.eq(d.theme, null); assert.eq(d.sidebarCollapsed, false); assert.eq(d.sidebarWidth, S.SIDEBAR.min);
+    assert.eq(d.notify, false);
+    assert.eq(S.sanitizeView({}).sidebarWidth, S.SIDEBAR.initial);
+    assert.eq(S.sanitizeView({ taskStatusFilter: 'cancelled' }).taskStatusFilter, 'cancelled');
+  });
+
+  test('store: draft images survive, with safe metadata only', function () {
+    var s = S.create(S.memoryStorage(), { now: function () { return 5; } });
+    var k = s.drafts.key({ convId: 3 });
+    s.drafts.save(k, { text: '', attachments: [{ id: 7, filename: 'plot.png', mime_type: 'image/png', size_bytes: 900, x: 1 },
+                                              { id: 7 }, { id: -1 }, { id: '8' }, { id: 9, mime_type: 'text/html' }] });
+    var d = s.drafts.load(k);
+    assert.deep(d.attachments, [{ id: 7, filename: 'plot.png', mime_type: 'image/png', size_bytes: 900 },
+                                { id: 9, filename: 'image', mime_type: null, size_bytes: null }]);
+    s.drafts.save(k, { text: '', attachments: [] });
+    assert.eq(s.drafts.load(k), null, 'empty text with no images deletes the draft');
   });
 
   test('store: storage errors never throw', function () {
@@ -265,6 +292,26 @@
     assert.eq(bad.text, 'X');
   });
 
+  test('brand: provider keys, aliases and names', function () {
+    assert.eq(B.key('Anthropic'), 'anthropic');
+    assert.eq(B.key('kimi'), 'moonshot');
+    assert.eq(B.key('codex'), 'openai');
+    assert.eq(B.key(''), 'other');
+    assert.eq(B.providerName('openai'), 'OpenAI');
+    assert.eq(B.providerName('google'), 'Google');
+    assert.eq(B.providerName('deepseek'), 'DeepSeek');
+    assert.eq(B.providerName('acme'), 'Acme');
+    assert.deep(B.PROVIDERS, ['anthropic', 'openai', 'google', 'gemini', 'moonshot']);
+  });
+
+  test('avatar: Feishu image avatars use safe paths only', function () {
+    assert.eq(A.spec({ handle: 'gem', avatar: { image: '/static/avatars/gem.png', icon: 'gem' } }).image, '/static/avatars/gem.png');
+    assert.eq(A.spec({ handle: 'x', avatar: { image: '/static/avatars/../app.js' } }).image, null);
+    assert.eq(A.spec({ handle: 'x', avatar: { image: 'https://evil.example/a.png' } }).image, null);
+    assert.eq(A.spec({ handle: 'x', avatar: { image: '/static/vendor/katex/x.png' } }).image, null);
+    assert.eq(A.imagePath('/static/avatars/kimi.png'), '/static/avatars/kimi.png');
+  });
+
   test('avatar: server formats (preset string, icon and colour, emoji, short text)', function () {
     var preset = A.spec({ handle: 'g', avatar: 'gem' });
     assert.eq(preset.text, '\u25c6');
@@ -283,23 +330,40 @@
   // lifecycle.js
   // ---------------------------------------------------------------------------
 
-  test('lifecycle: phases follow the state machine', function () {
+  test('lifecycle: compact receipts follow the delivery state', function () {
     var base = { id: 10, conversation_id: 1, recipient: { id: 2 }, state: 'waiting', queue_position: 2 };
-    assert.eq(L.phase({ local: 'sending' }).phase, 'sending');
-    assert.eq(L.phase({ local: 'send_failed', local_error: 'offline' }).label, 'Not sent: offline');
-    assert.eq(L.phase(base).label, 'Waiting in queue (#2)');
-    assert.eq(L.phase(Object.assign({}, base, { queue_position: 1 })).label, 'Waiting in queue');
+    var r = L.receipt({ local: 'sending' });
+    assert.eq(r.kind, 'sending'); assert.eq(r.checks, 0); assert.eq(r.label, 'Sending\u2026');
+    assert.eq(L.receipt({ local: 'send_failed', local_error: 'offline' }).label, 'Not sent: offline');
+    r = L.receipt(base);
+    assert.eq(r.kind, 'server'); assert.eq(r.checks, 1); assert.eq(r.label, 'Server, #2 in queue');
+    assert.deep(r.actions, ['cancel']);
+    assert.eq(L.receipt(Object.assign({}, base, { queue_position: 1 })).label, 'Server');
     var d = Object.assign({}, base, { state: 'delivered', delivered_at: 1000 });
-    assert.eq(L.phase(d, { now: 1010 }).phase, 'delivered');
-    assert.eq(L.phase(d, { now: 1000 + 1200 }).stale, true);
+    r = L.receipt(d);
+    assert.eq(r.kind, 'read'); assert.eq(r.checks, 2); assert.eq(r.label, 'Agent read'); assert.deep(r.actions, ['details']);
+    assert.eq(L.receipt(d, { replied: true }).kind, 'replied');
+    r = L.receipt(Object.assign({}, base, { state: 'unconfirmed' }));
+    assert.eq(r.tone, 'warn'); assert.deep(r.actions, ['retry', 'details']);
+    assert.eq(L.receipt(Object.assign({}, base, { state: 'failed', state_reason: 'timeout' })).label, 'Failed: timeout');
+    r = L.receipt(Object.assign({}, base, { state: 'cancelled' }));
+    assert.eq(r.label, 'Cancelled'); assert.eq(r.checks, 0);
+  });
+
+  test('lifecycle: live bubble only while the agent is on it', function () {
+    var d = { id: 10, conversation_id: 1, recipient: { id: 2 }, state: 'delivered', delivered_at: 1000 };
+    assert.eq(L.live(d, { now: 1010 }), null, 'no progress, no live bubble');
     var think = Object.assign({}, d, { progress: { phase: 'thinking' } });
-    assert.eq(L.phase(think, { now: 1010 }).phase, 'thinking');
-    var work = Object.assign({}, d, { progress: { phase: 'working', summary: 'Auditing', bullets: [{ text: 'a', status: 'done' }] } });
-    assert.eq(L.phase(work).label, 'Auditing');
-    assert.eq(L.phase(work, { replied: true }).phase, 'complete');
-    assert.eq(L.phase(Object.assign({}, base, { state: 'unconfirmed' })).phase, 'unconfirmed');
-    assert.eq(L.phase(Object.assign({}, base, { state: 'failed', state_reason: 'timeout' })).label, 'Failed: timeout');
-    assert.eq(L.phase(Object.assign({}, work, { state: 'failed' })).phase, 'failed', 'failure outranks progress');
+    var info = L.live(think, { now: 1065 });
+    assert.eq(info.phase, 'thinking'); assert.eq(info.label, 'Thinking'); assert.eq(info.elapsed, 65);
+    assert.eq(L.clock(65), '1:05'); assert.eq(L.clock(3725), '1:02:05');
+    var work = Object.assign({}, d, { progress: { phase: 'working', summary: 'Auditing', bullets: [{ text: 'a', state: 'done' }] } });
+    assert.eq(L.live(work).label, 'Auditing');
+    assert.eq(L.live(work, { replied: true }), null, 'the reply replaces the live bubble');
+    assert.eq(L.live(Object.assign({}, work, { state: 'waiting' })), null);
+    var ask = Object.assign({}, d, { progress: { phase: 'input_required', summary: 'Which branch?' } });
+    assert.eq(L.live(ask).label, 'Needs your input: Which branch?');
+    assert.eq(L.live(work, { agentStatus: 'stalled', now: 1000 }).stalled, true);
   });
 
   test('lifecycle: reply detection and progress cleaning', function () {
@@ -319,14 +383,15 @@
     assert.deep(p.bullets.map(function (b) { return b.status; }), ['done', 'active', 'pending']);
     assert.eq(p.stale, true);
     assert.eq(L.cleanProgress({ phase: 'working', stale: 'yes' }).stale, false, 'only a real true counts');
+    assert.eq(L.cleanProgress({ phase: 'input_required' }).phase, 'input_required');
     var m = { id: 10, conversation_id: 1, recipient: { id: 2 }, state: 'delivered', delivered_at: 900,
               progress: { phase: 'working', summary: 'Auditing', updated_at: 1000, stale: true } };
-    var info = L.phase(m, { now: 1000 + 300 });
+    var info = L.live(m, { now: 1000 + 300 });
     assert.eq(info.phase, 'working');
     assert.eq(info.stale, true);
     assert.eq(info.label, 'No update for 5 min: Auditing');
-    var fresh = L.phase(Object.assign({}, m, { progress: { phase: 'thinking', updated_at: 1290 } }), { now: 1300 });
+    var fresh = L.live(Object.assign({}, m, { progress: { phase: 'thinking', updated_at: 1290 } }), { now: 1300 });
     assert.ok(!fresh.stale, 'fresh progress is not stale');
-    assert.eq(fresh.label, 'Thinking\u2026');
+    assert.eq(fresh.label, 'Thinking');
   });
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -6,7 +6,8 @@
 // principal.avatar follows the server (schema v4): a preset string (an icon token such as
 // "star", a short emoji, or initials) or an object { icon, color } where color is a hex value
 // or a palette name. The older { bg, fg } form is also accepted. Colours are validated and
-// applied through the CSSOM, never as markup.
+// applied through the CSSOM, never as markup. Schema v5 adds { image: "/static/avatars/<file>" }:
+// the picture is cropped to the circle and falls back to the icon or initials if it fails to load.
 (function (root) {
   'use strict';
 
@@ -27,6 +28,11 @@
                 gem: '◆', orbit: '◎', leaf: '❦', wave: '∿', key: '⚷' };
   var SIZES = { xs: 'avatar-xs', sm: 'avatar-sm', md: 'avatar-md', lg: 'avatar-lg' };
   var HEX_RE = /^#[0-9a-fA-F]{6}$/;
+  var IMAGE_RE = /^\/static\/avatars\/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/;   // same rule as the server
+
+  function imagePath(v) {
+    return typeof v === 'string' && IMAGE_RE.test(v) && v.indexOf('..') === -1 ? v : null;
+  }
   var NAMED = { red: '#b4233c', orange: '#a23d05', amber: '#8a4b08', yellow: '#ffd60a', gold: '#c98a12',
                 green: '#08704f', blue: '#1d4fd8', navy: '#1e2f6b', purple: '#7b2cbf', pink: '#be185d',
                 gray: '#475569', grey: '#475569', black: '#0f1626', white: '#ffffff' };
@@ -114,7 +120,8 @@
     var text = initials(p.display_name, p.handle);
     var g = a ? glyph(a.icon) : null;
     if (g) { text = g; custom = true; }
-    return { bg: bg, fg: fg, text: text, custom: custom, hue: c ? null : base.name };
+    return { bg: bg, fg: fg, text: text, custom: custom, hue: c ? null : base.name,
+             image: a ? imagePath(a.image) : null };
   }
 
   function el(principal, size, options) {
@@ -124,12 +131,28 @@
     var n = doc.createElement('span');
     n.className = 'avatar ' + (SIZES[size] || SIZES.md);
     if (o.consul) n.classList.add('is-consul');
-    n.style.backgroundColor = s.bg;
-    n.style.color = s.fg;
+    var paint = function () { n.style.backgroundColor = s.bg; n.style.color = s.fg; };
     var label = doc.createElement('span');
     label.className = 'avatar-text';
     label.textContent = s.text;
     n.appendChild(label);
+    if (s.image) {
+      var img = doc.createElement('img');
+      img.className = 'avatar-img';
+      img.alt = '';
+      img.decoding = 'async';
+      img.draggable = false;
+      img.addEventListener('error', function () {      // missing or blocked file: icon or initials
+        if (img.parentNode) img.parentNode.removeChild(img);
+        n.classList.remove('has-image');
+        paint();
+      });
+      img.src = s.image;
+      n.classList.add('has-image');
+      n.appendChild(img);
+    } else {
+      paint();
+    }
     if (o.status === 'on' || o.status === 'off') {
       var dot = doc.createElement('span');
       dot.className = 'avatar-status ' + (o.status === 'on' ? 'is-on' : 'is-off');
@@ -156,7 +179,7 @@
   }
 
   root.LyraAvatar = {
-    version: '2.0.0',
+    version: '3.0.0',
     PALETTE: PALETTE.map(function (p) { return Object.assign({}, p); }),
     ICONS: Object.assign({}, ICONS),
     spec: spec,
@@ -166,5 +189,6 @@
     contrast: contrast,
     color: color,
     hash: fnv1a,
+    imagePath: imagePath,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -4,10 +4,14 @@
 # the public API (tests/js/qa_board.py), serves the board with its live CSP
 # through a sign-in proxy, and drives it over the DevTools pipe (tests/js/cdp.py):
 #   - desktop 1440x900 and phone 390x844 (touch, DPR 2) feature probes
-#     (tests/js/qa/probe.js): sidebar groupings, pins, unread and read receipts,
-#     Markdown + KaTeX, imgpop, lifecycle, drafts, projects and tasks,
-#     Admin & Senate, quick switcher, shortcuts, SSE reconnect banner
-#   - zero page errors and zero console errors or CSP violations
+#     (tests/js/qa/probe.js): Needs you, honest status chips, hold, context
+#     rings, host aliases (right-click), pools, collapsible and resizable
+#     sidebar, theme switch, live agent bubble, receipts, Cancel, delivery
+#     Details, draft images, projects and tasks (cancelled, blocked reason,
+#     versions), Senate with Server Storage cleanup, notifications toggle,
+#     shortcuts (Ctrl+K, N, X, H, Alt+arrows), SSE reconnect banner
+#   - zero page errors, console errors or CSP violations, and no element that
+#     crosses its rail, card or row container
 #   - visual QA screenshots in light and dark (kept when LYRA_QA_SHOTS=<dir>)
 # =============================================================================
 
@@ -37,9 +41,11 @@ class WiredBoardTests(unittest.TestCase):
     self.addCleanup(self.board.close)
     self.addCleanup(self.proxy.close)
 
-  def run_probe(self, width, height, mobile=False, dpr=1):
+  def run_probe(self, width, height, mobile=False, dpr=1, theme='light'):
     chrome = Chrome().open_page(width, height, mobile=mobile, dpr=dpr)
     try:
+      chrome.send('Emulation.setEmulatedMedia', {'features': [{'name': 'prefers-color-scheme', 'value': theme}]})
+      chrome.grant(self.proxy.base, ['notifications'])
       chrome.navigate(self.proxy.base + '/?qa=probe')
       chrome.wait_for("!!document.getElementById('lyra-qa')", timeout=150)   # app.js owns the title
       result = json.loads(chrome.eval("document.getElementById('lyra-qa').textContent"))
@@ -48,21 +54,31 @@ class WiredBoardTests(unittest.TestCase):
       chrome.close()
     return result
 
-  def check(self, result, layout, min_steps):
+  def check(self, result, layout, min_steps, theme='light'):
     self.assertEqual(result['layout'], layout)
+    self.assertEqual(result['theme'], theme)
     failed = [f"{r['name']}: {r.get('error')}" for r in result['results'] if not r['ok']]
     self.assertEqual(failed, [])
     self.assertGreaterEqual(len(result['results']), min_steps)
     self.assertEqual(result['errors'], [], 'uncaught page errors')
     self.assertEqual(result['console'], [], 'console errors or CSP violations under the live CSP')
+    self.assertEqual(result['overflow'], [], 'elements crossing their containers')
 
-  def test_desktop_board(self):
-    self.check(self.run_probe(1440, 900), 'desktop', 20)
+  def test_desktop_board_light(self):
+    self.check(self.run_probe(1440, 900), 'desktop', 32)
 
-  def test_phone_board(self):
+  def test_desktop_board_dark(self):
+    self.check(self.run_probe(1440, 900, theme='dark'), 'desktop', 32, theme='dark')
+
+  def test_phone_board_light(self):
     r = self.run_probe(390, 844, mobile=True, dpr=2)
     self.assertEqual(r['viewport'], [390, 844])
-    self.check(r, 'mobile', 4)
+    self.check(r, 'mobile', 6)
+
+  def test_phone_board_dark(self):
+    r = self.run_probe(390, 844, mobile=True, dpr=2, theme='dark')
+    self.assertEqual(r['viewport'], [390, 844])
+    self.check(r, 'mobile', 6, theme='dark')
 
   def test_visual_qa_screenshots(self):
     keep = os.environ.get('LYRA_QA_SHOTS')
@@ -72,10 +88,14 @@ class WiredBoardTests(unittest.TestCase):
     paths, problems = qa_shots.capture_all(Chrome, self.proxy.base, out)
     self.assertEqual(problems, [])
     names = {Path(p).name for p in paths}
-    for name in ('desktop-chats-thread.png', 'desktop-chats-thread-dark.png', 'desktop-projects.png',
-                 'desktop-admin-senate.png', 'mobile-chats-list.png', 'mobile-thread.png', 'mobile-agents.png',
-                 'mobile-project-detail.png', 'mobile-imgpop.png', 'mobile-thread-dark.png'):
-      self.assertIn(name, names)
+    for theme in ('light', 'dark'):
+      for view in ('desktop-chats-live', 'desktop-needs-input', 'desktop-pools-queue', 'desktop-details', 'desktop-host-menu',
+                   'desktop-composer-attach', 'desktop-projects', 'desktop-senate', 'desktop-senate-pools', 'desktop-storage',
+                   'desktop-sidebar-collapsed', 'mobile-chats-list', 'mobile-thread-live', 'mobile-agents', 'mobile-machines',
+                   'mobile-pools', 'mobile-project-detail', 'mobile-senate', 'mobile-senate-pools', 'mobile-storage'):
+        self.assertIn(f'{view}-{theme}.png', names)
+    self.assertIn('favicon-sizes.png', names)
+    self.assertEqual(len(paths), 45)
     for p in paths:
       data = Path(p).read_bytes()
       self.assertTrue(data.startswith(b'\x89PNG') and len(data) > 10_000, p)

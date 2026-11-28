@@ -1,27 +1,46 @@
-// Lyra v2 board (UI_DESIGN_V2.md). Every node is built with createElement / createTextNode;
-// no HTML string is ever parsed. Modules: LyraMarkdown, LyraImgPop, LyraStore, LyraAvatar,
-// LyraLifecycle (loaded before this file).
+// Lyra board, Stage 3 (UI_DESIGN_V2.md, schema v5). Every node is built with createElement /
+// createTextNode; no HTML string is ever parsed. Modules loaded first: LyraBrand (head),
+// LyraMarkdown, LyraImgPop, LyraStore, LyraAvatar, LyraLifecycle.
 'use strict';
 
 const $ = (id) => document.getElementById(id);
 const MOD = {
   md: window.LyraMarkdown || null, pop: window.LyraImgPop || null, store: window.LyraStore || null,
-  av: window.LyraAvatar || null, life: window.LyraLifecycle || null,
+  av: window.LyraAvatar || null, life: window.LyraLifecycle || null, brand: window.LyraBrand || null,
 };
 const store = MOD.store ? MOD.store.create() : null;
 const mqDesktop = window.matchMedia('(min-width: 960px)');
 const mqWide = window.matchMedia('(min-width: 1200px)');
+const mqDark = window.matchMedia('(prefers-color-scheme: dark)');
 const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 const TASK_STATES = [['open', 'Open'], ['in_progress', 'In progress'], ['in_review', 'In review'],
-  ['blocked', 'Blocked'], ['done', 'Done']];
+  ['blocked', 'Blocked'], ['done', 'Done'], ['cancelled', 'Cancelled']];
 const PROJECT_STATES = [['active', 'Active'], ['paused', 'Paused'], ['completed', 'Completed'], ['archived', 'Archived']];
 const PRIORITIES = [[0, 'Low'], [1, 'Normal'], [2, 'High'], [3, 'Urgent']];
+const SIDEBAR = MOD.store ? MOD.store.SIDEBAR : { min: 280, max: 560, initial: 360 };
+const WATCHDOG_MS = 30000;          // the server sends `event: tick` every 15 s
+const FAILED_WINDOW = 86400;        // "recent" failed deliveries for Needs you
+
+// Honest presence chips (schema v5 effective_status). rank orders rows by attention.
+const STATUS = {
+  needs_input: { label: 'needs input', cls: 'info', rank: 0, title: 'Waiting for your input' },
+  stalled: { label: 'stalled', cls: 'bad', rank: 1, title: 'Busy, but no activity for a long time' },
+  stale: { label: 'no updates', cls: 'warn', rank: 2, title: 'Working, but progress updates stopped' },
+  detached: { label: 'detached', cls: 'warn', rank: 3, title: 'Online, but its session stream is not attached' },
+  working: { label: 'working', cls: 'info', rank: 4 },
+  unknown: { label: 'unknown', cls: '', rank: 5, title: 'Online, activity not reported' },
+  idle: { label: 'idle', cls: 'ok', rank: 6 },
+  offline: { label: 'offline', cls: '', rank: 7 },
+};
 
 const S = {
   me: null, board: null, convs: [], conv: null, msgs: [], replyTo: null, view: null,
-  es: null, lastEventId: null, conn: { up: false, attempt: 0, timer: null, tick: null, retryAt: 0, wasDown: false },
+  es: null, lastEventId: null,
+  conn: { up: false, attempt: 0, timer: null, tick: null, retryAt: 0, wasDown: false, lastBeat: 0 },
   sending: false, staged: [], navigation: 0, optimistic: [], readInFlight: {},
-  pending: { board: false, convs: false, conv: false, timer: null }, lifeNodes: new Map(), qs: { items: [], all: [], sel: 0 },
+  pending: { board: false, convs: false, conv: false, timer: null }, receiptNodes: new Map(),
+  qs: { items: [], all: [], sel: 0 }, needs: [], needsKeys: null, failed: new Map(), notifyConvs: new Set(),
+  audio: null, menuHost: null,
 };
 
 // =============================================================================
@@ -51,7 +70,7 @@ const ICONS = {
   pin: 'M9 4h6l-1 5 3 3H7l3-3-1-5zM12 15v5',
   back: 'M15 6l-6 6 6 6',
   chevron: 'M9 6l6 6-6 6',
-  host: 'M4 5h16v10H4zM8 19h8M12 15v4',
+  bell: 'M6 16V11a6 6 0 0112 0v5l1.5 2h-15L6 16zM10 20.5a2.2 2.2 0 004 0',
 };
 function icon(name, size) {
   const svg = document.createElementNS(SVG_NS, 'svg');
@@ -71,6 +90,13 @@ function icon(name, size) {
   return svg;
 }
 
+function prov(name, size, title) {
+  if (!MOD.brand) return null;
+  return MOD.brand.provider(name, size || 14, { title: title === undefined ? null : title });
+}
+
+function providerName(p) { return MOD.brand ? MOD.brand.providerName(p) : String(p || 'Other'); }
+
 function now() { return Date.now() / 1000; }
 
 function ago(ts) {
@@ -82,6 +108,14 @@ function ago(ts) {
   return `${Math.round(s / 86400)} d ago`;
 }
 
+function span(ts) {
+  const s = Math.max(0, Math.round(now() - ts));
+  if (s < 60) return `${s} s`;
+  if (s < 3600) return `${Math.round(s / 60)} min`;
+  if (s < 86400) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86400)} d`;
+}
+
 // Text node that the 15-second tick updates in place (spec 3.2 rule 5).
 function agoNode(ts, prefix) {
   return h('span', { class: 'ago', 'data-ago': ts || 0, 'data-prefix': prefix || '' }, (prefix || '') + ago(ts));
@@ -90,8 +124,7 @@ function agoNode(ts, prefix) {
 function shortTime(ts) {
   if (!ts) return '';
   const d = new Date(ts * 1000);
-  const today = new Date();
-  if (d.toDateString() === today.toDateString()) {
+  if (d.toDateString() === new Date().toDateString()) {
     return new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' }).format(d);
   }
   return new Intl.DateTimeFormat([], { month: 'short', day: 'numeric' }).format(d);
@@ -101,8 +134,36 @@ function fullTime(ts) {
   return ts ? new Intl.DateTimeFormat([], { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ts * 1000)) : '';
 }
 
+function preciseTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const t = new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(d);
+  return `${t}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+
 function fmtNum(n, digits) {
   return new Intl.NumberFormat([], { maximumFractionDigits: digits == null ? 0 : digits }).format(n);
+}
+
+// 22.5 / 32 GB, 492 / 1858 GB: no digit grouping, one decimal under 100.
+function fmtGB(n) {
+  return new Intl.NumberFormat([], { maximumFractionDigits: n < 100 ? 1 : 0, useGrouping: false }).format(n);
+}
+
+function fmtBytes(n) {
+  if (n == null) return 'unknown';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = Number(n); let i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${fmtNum(v, v < 10 && i ? 1 : 0)} ${units[i]}`;
+}
+
+function fmtMs(ms) {
+  if (ms == null) return 'n/a';
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${fmtNum(s, 1)} s`;
+  return `${Math.floor(s / 60)} min ${Math.round(s % 60)} s`;
 }
 
 function isTyping(el) {
@@ -197,19 +258,19 @@ $('logout').addEventListener('click', async () => {
 });
 
 // =============================================================================
-// View state (localStorage) and tabs
+// View state, theme, tabs and sidebar
 // =============================================================================
 
 function viewCtx() {
   const b = S.board || {};
   return {
     desktop: mqDesktop.matches,
-    convIds: S.convs.map((c) => c.id),
-    agentIds: (b.agents || []).map((a) => a.id),
-    machineIds: (b.hosts || []).map((x) => x.host).concat(['__unknown__']),
+    convIds: S.board ? S.convs.map((c) => c.id) : null,
+    agentIds: S.board ? (b.agents || []).map((a) => a.id) : null,
+    machineIds: S.board ? (b.hosts || []).map((x) => x.host).concat(['__unknown__']) : null,
     providerIds: null,
-    poolIds: (b.pools || []).map((p) => p.id),
-    projectIds: (b.projects || []).map((p) => p.id),
+    poolIds: S.board ? (b.pools || []).map((p) => p.id) : null,
+    projectIds: S.board ? (b.projects || []).map((p) => p.id) : null,
   };
 }
 
@@ -218,7 +279,8 @@ function loadView() {
     activeTab: 'chats', agentGroupMode: 'machine', expandedAgentIds: [], expandedMachineIds: [],
     expandedProviderIds: [], expandedPoolIds: [], selectedConvId: null, pendingAgentId: null,
     activeProjectId: null, projectStatusFilter: 'all', taskStatusFilter: 'all', mobileChatView: 'list',
-    projectView: 'list' };
+    projectView: 'list', theme: null, sidebarCollapsed: false, sidebarWidth: SIDEBAR.initial, notify: false,
+    mutedAgentIds: [] };
 }
 
 function saveView() { if (store && S.view) store.view.save(S.view); }
@@ -228,6 +290,30 @@ function toggleIn(list, id) {
   if (i === -1) list.push(id); else list.splice(i, 1);
   saveView();
 }
+
+// --- theme -----------------------------------------------------------------
+
+function effectiveTheme() {
+  return S.view && S.view.theme ? S.view.theme : (mqDark.matches ? 'dark' : 'light');
+}
+
+function applyTheme() {
+  if (MOD.brand) MOD.brand.applyTheme(S.view.theme);
+  const dark = effectiveTheme() === 'dark';
+  const t = $('themeToggle');
+  t.setAttribute('aria-checked', String(dark));
+  t.title = dark ? 'Dark theme (switch to light)' : 'Light theme (switch to dark)';
+  t.querySelector('.sr-only').textContent = 'Dark theme';
+}
+
+$('themeToggle').addEventListener('click', () => {
+  S.view.theme = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  saveView();
+  applyTheme();
+});
+mqDark.addEventListener('change', () => { if (!S.view.theme) applyTheme(); });
+
+// --- tabs ------------------------------------------------------------------
 
 function currentTab() {
   const t = S.view.activeTab;
@@ -257,6 +343,67 @@ document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () 
 mqDesktop.addEventListener('change', () => { renderTabs(); autoGrow(); });
 mqWide.addEventListener('change', () => { renderTabs(); maybeMarkRead(); });
 
+// --- collapsible and resizable sidebar ---------------------------------------
+
+function applySidebar() {
+  const collapsed = !!S.view.sidebarCollapsed;
+  $('layout').classList.toggle('sidebar-collapsed', collapsed);
+  document.documentElement.style.setProperty('--sidebar-w', S.view.sidebarWidth + 'px');
+  const t = $('sidebar-toggle');
+  t.setAttribute('aria-expanded', String(!collapsed));
+  t.title = collapsed ? 'Show agents sidebar (H)' : 'Hide agents sidebar (H)';
+  $('sidebar-resizer').setAttribute('aria-valuenow', String(S.view.sidebarWidth));
+}
+
+function toggleSidebar() {
+  if (!mqDesktop.matches) { setTab(currentTab() === 'agents' ? 'chats' : 'agents'); return; }
+  S.view.sidebarCollapsed = !S.view.sidebarCollapsed;
+  saveView();
+  applySidebar();
+}
+
+function setSidebarWidth(w, persist) {
+  S.view.sidebarWidth = Math.max(SIDEBAR.min, Math.min(SIDEBAR.max, Math.round(w)));
+  applySidebar();
+  if (persist) saveView();
+}
+
+$('sidebar-toggle').addEventListener('click', toggleSidebar);
+(function wireResizer() {
+  const r = $('sidebar-resizer');
+  let startX = 0; let startW = 0;
+  const move = (ev) => setSidebarWidth(startW + (ev.clientX - startX), false);
+  const up = (ev) => {
+    r.releasePointerCapture(ev.pointerId);
+    r.classList.remove('is-dragging');
+    document.body.classList.remove('is-resizing');
+    r.removeEventListener('pointermove', move);
+    r.removeEventListener('pointerup', up);
+    r.removeEventListener('pointercancel', up);
+    saveView();
+  };
+  r.addEventListener('pointerdown', (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    startX = ev.clientX;
+    startW = $('pane-agents').getBoundingClientRect().width;
+    r.setPointerCapture(ev.pointerId);
+    r.classList.add('is-dragging');
+    document.body.classList.add('is-resizing');
+    r.addEventListener('pointermove', move);
+    r.addEventListener('pointerup', up);
+    r.addEventListener('pointercancel', up);
+  });
+  r.addEventListener('dblclick', () => setSidebarWidth(SIDEBAR.initial, true));
+  r.addEventListener('keydown', (ev) => {
+    const step = ev.shiftKey ? 48 : 16;
+    const keys = { ArrowLeft: -step, ArrowRight: step };
+    if (keys[ev.key]) { ev.preventDefault(); setSidebarWidth(S.view.sidebarWidth + keys[ev.key], true); }
+    else if (ev.key === 'Home') { ev.preventDefault(); setSidebarWidth(SIDEBAR.min, true); }
+    else if (ev.key === 'End') { ev.preventDefault(); setSidebarWidth(SIDEBAR.max, true); }
+  });
+})();
+
 // =============================================================================
 // Loading and live refresh
 // =============================================================================
@@ -265,13 +412,15 @@ async function refreshAll(initial) {
   const [board, convs] = await Promise.all([api('GET', '/api/v1/board'), api('GET', '/api/v1/conversations')]);
   S.board = board;
   S.convs = convs.conversations || [];
-  if (initial || !S.view) loadView();
+  // Seed the SSE cursor from the snapshot so no event between load and connect is missed.
+  if (S.lastEventId == null && board.last_event_id != null) S.lastEventId = String(board.last_event_id);
+  if (initial || !S.view) { loadView(); applyTheme(); applySidebar(); renderNotifyToggle(); }
   renderTabs();
   renderAgents();
   renderConvList();
   renderProjects();
-  renderAdminSenate();
-  renderUnreadTotals();
+  renderSenate();
+  renderTitle();
   if (initial) {
     if (S.view.selectedConvId != null) await openConv(S.view.selectedConvId, { restore: true });
     else if (S.view.pendingAgentId != null) {
@@ -304,18 +453,19 @@ async function runRefresh() {
       want.convs ? api('GET', '/api/v1/conversations') : null]);
     if (board) {
       S.board = board;
-      renderAgents(); renderProjects(); renderAdminSenate();
+      renderAgents(); renderProjects(); renderSenate();
     }
-    if (convs) { S.convs = convs.conversations || []; renderConvList(); renderUnreadTotals(); }
+    if (convs) { S.convs = convs.conversations || []; renderConvList(); notifyNewMessages(); }
+    if (board || convs) renderTitle();
     if ((want.conv || board) && S.conv && S.conv.id) await reloadConv();
     else if (board && S.conv) { renderThreadHeader(); renderComposer(); }
   } catch (_e) { /* the next event or reconnect retries */ }
 }
 
-// --- SSE with a visible reconnect banner and jittered backoff (section 8) ------
+// --- SSE: cursor seeded from /board, reset reloads, tick watchdog, reconnect banner --------
 
-const EVENT_TYPES = ['presence', 'principal', 'invite', 'pool', 'project', 'message', 'message_state',
-  'message_progress', 'conversation'];
+const EVENT_TYPES = ['presence', 'principal', 'invite', 'pool', 'host', 'project', 'message', 'message_state',
+  'message_progress', 'conversation', 'reset', 'tick'];
 
 function stopEvents() {
   if (S.es) { S.es.close(); S.es = null; }
@@ -328,10 +478,12 @@ function connectEvents() {
   const url = '/api/v1/events' + (S.lastEventId ? '?last=' + encodeURIComponent(S.lastEventId) : '');
   const es = new EventSource(url);
   S.es = es;
+  S.conn.lastBeat = Date.now();
   es.onopen = () => {
     const recovered = S.conn.wasDown;
     S.conn.attempt = 0;
     S.conn.wasDown = false;
+    S.conn.lastBeat = Date.now();
     setConn(true);
     if (recovered) {
       showBanner('Back online. Refreshing…', true);
@@ -339,25 +491,45 @@ function connectEvents() {
       refreshAll(false).catch(() => {});
     }
   };
-  es.onerror = () => {
-    es.close();
-    if (S.es === es) S.es = null;
-    S.conn.wasDown = true;
-    setConn(false);
-    // A 401 shows the sign-in card (api() handles it); anything else keeps retrying.
-    api('GET', '/api/v1/auth/me').then(() => planReconnect(), (e) => { if (e.status !== 401) planReconnect(); });
-  };
+  es.onerror = () => dropConnection(es);
   for (const t of EVENT_TYPES) es.addEventListener(t, (ev) => onEvent(t, ev));
 }
 
+function dropConnection(es) {
+  if (es) es.close();
+  if (!es || S.es === es) S.es = null;
+  S.conn.wasDown = true;
+  setConn(false);
+  // A 401 shows the sign-in card (api() handles it); anything else keeps retrying.
+  api('GET', '/api/v1/auth/me').then(() => planReconnect(), (e) => { if (e.status !== 401) planReconnect(); });
+}
+
+// Health watchdog: a silent stream (no tick or event for 30 s) is treated as dead.
+setInterval(() => {
+  if (S.es && S.conn.up && Date.now() - S.conn.lastBeat > WATCHDOG_MS) dropConnection(S.es);
+}, 5000);
+
 function onEvent(type, ev) {
+  S.conn.lastBeat = Date.now();
   if (ev.lastEventId) S.lastEventId = ev.lastEventId;
+  if (type === 'tick') return;
   let d = {};
   try { d = JSON.parse(ev.data); } catch (_e) { d = {}; }
+  if (type === 'reset') {           // our cursor is outside the server's window: reload everything
+    if (d.latest_id != null) S.lastEventId = String(d.latest_id);
+    refreshAll(false).catch(() => {});
+    return;
+  }
   const inConv = S.conv && S.conv.id != null && d.conversation_id === S.conv.id;
   switch (type) {
-    case 'message': schedule({ convs: true, conv: inConv }); break;
-    case 'message_state': schedule({ conv: inConv, convs: false }); break;
+    case 'message':
+      if (d.state === 'delivered') S.notifyConvs.add(d.conversation_id);   // a message to the owner
+      schedule({ convs: true, conv: inConv, board: true });
+      break;
+    case 'message_state':
+      if (d.state === 'failed') noteFailed(d.conversation_id);
+      schedule({ conv: inConv, board: true });
+      break;
     case 'message_progress': schedule({ conv: inConv, board: true }); break;
     case 'conversation': schedule({ convs: true }); break;
     default: schedule({ board: true });
@@ -400,24 +572,126 @@ function planReconnect() {
 $('conn-retry').addEventListener('click', () => { S.conn.attempt = 0; connectEvents(); });
 
 // =============================================================================
-// Agents sidebar: summary-first rows, By machine / By provider
+// Notifications: hidden-tab desktop notices, a soft chime, per-agent mute
+// =============================================================================
+
+function notifySupported() { return 'Notification' in window; }
+
+function renderNotifyToggle() {
+  const b = $('notifyToggle');
+  const perm = notifySupported() ? Notification.permission : 'unsupported';
+  const on = !!S.view.notify && perm === 'granted';
+  b.setAttribute('aria-pressed', String(on));
+  b.title = perm === 'unsupported' ? 'Desktop notifications are not supported in this browser'
+    : perm === 'denied' ? 'Desktop notifications are blocked in the browser settings'
+      : on ? 'Desktop notifications are on (when this tab is hidden)' : 'Desktop notifications are off';
+}
+
+$('notifyToggle').addEventListener('click', async () => {
+  if (!notifySupported()) { renderNotifyToggle(); return; }
+  primeAudio();
+  if (S.view.notify) {
+    S.view.notify = false;
+  } else {
+    let perm = Notification.permission;
+    if (perm === 'default') {
+      try { perm = await Notification.requestPermission(); } catch (_e) { perm = 'denied'; }
+    }
+    S.view.notify = perm === 'granted';
+    if (S.view.notify) chime();
+  }
+  saveView();
+  renderNotifyToggle();
+});
+
+function primeAudio() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  if (!S.audio) { try { S.audio = new Ctx(); } catch (_e) { S.audio = null; } }
+  if (S.audio && S.audio.state === 'suspended') S.audio.resume().catch(() => {});
+  return S.audio;
+}
+
+// Two short sine tones, quiet and soft-edged.
+function chime() {
+  const ctx = primeAudio();
+  if (!ctx) return;
+  const t0 = ctx.currentTime + 0.01;
+  [[880, 0], [1318.5, 0.11]].forEach(([freq, at]) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t0 + at);
+    gain.gain.exponentialRampToValueAtTime(0.06, t0 + at + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + at + 0.22);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0 + at);
+    osc.stop(t0 + at + 0.25);
+  });
+}
+
+function isMuted(agentId) { return S.view.mutedAgentIds.includes(agentId); }
+
+function notify(title, body, tag, onOpen) {
+  if (!S.view.notify || !document.hidden || !notifySupported() || Notification.permission !== 'granted') return false;
+  try {
+    const n = new Notification(title, { body, tag, icon: '/static/favicon.svg', silent: true });
+    n.onclick = () => { window.focus(); n.close(); if (onOpen) onOpen(); };
+  } catch (_e) { return false; }
+  chime();
+  return true;
+}
+
+function notifyNewMessages() {
+  const ids = Array.from(S.notifyConvs);
+  S.notifyConvs.clear();
+  for (const id of ids) {
+    const c = S.convs.find((x) => x.id === id);
+    if (!c || c.kind !== 'owner_agent' || !c.last || c.last.sender_id === ownerId()) continue;
+    const a = convAgents(c)[0];
+    if (!a || isMuted(a.id)) continue;
+    notify(`${a.display_name}`, c.last.excerpt, `lyra-conv-${c.id}`, () => openConv(c.id, { user: true }));
+  }
+}
+
+function notifyNeeds(items) {
+  const keys = new Set(items.flatMap((n) => n.kinds.map((k) => `${n.agent.id}:${k}`)));
+  if (S.needsKeys) {
+    for (const n of items) {
+      const k = `${n.agent.id}:${n.kind}`;
+      if (n.kinds.every((x) => S.needsKeys.has(`${n.agent.id}:${x}`)) || isMuted(n.agent.id)) continue;
+      notify(`${n.agent.display_name} needs you`, n.why, `lyra-needs-${k}`, () => openWith(n.agent));
+    }
+  }
+  S.needsKeys = keys;
+}
+
+// =============================================================================
+// Agents sidebar: Needs you, summary-first rows, By machine / By provider
 // =============================================================================
 
 function agentById(id) { return ((S.board && S.board.agents) || []).find((a) => a.id === id) || null; }
 
 function activity(a) {
-  if (a.status !== 'admitted') return { key: 'revoked', label: 'revoked', cls: 'bad', rank: 5 };
-  const st = (a.presence && a.presence.effective_status) || 'offline';
-  if (st === 'stale') return { key: st, label: 'stalled', cls: 'warn', rank: 1, title: 'No progress update recently' };
-  if (st === 'working') return { key: st, label: 'working', cls: 'warn', rank: 2 };
-  if (st === 'idle') return { key: st, label: 'idle', cls: 'ok', rank: 3 };
-  return { key: 'offline', label: 'offline', cls: '', rank: 4 };
+  if (a.status !== 'admitted') return { key: 'revoked', label: 'revoked', cls: 'bad', rank: 9 };
+  const p = a.presence || {};
+  const key = STATUS[p.effective_status] ? p.effective_status : (p.online ? 'unknown' : 'offline');
+  const meta = STATUS[key];
+  const since = p.effective_since ? ` for ${span(p.effective_since)}` : '';
+  return { key, label: meta.label, cls: meta.cls, rank: meta.rank,
+    title: (meta.title ? meta.title + ', ' : '') + (p.effective_since ? `${meta.label}${since}` : meta.label) };
+}
+
+function statusPill(a) {
+  const act = activity(a);
+  return h('span', { class: 'pill ' + act.cls, title: act.title, 'data-status': act.key, text: act.label });
 }
 
 function attentionSort(list) {
   return list.slice().sort((x, y) => {
-    const ax = x.unconfirmed > 0 ? 0 : activity(x).rank;
-    const ay = y.unconfirmed > 0 ? 0 : activity(y).rank;
+    const ax = x.unconfirmed > 0 ? -1 : activity(x).rank;
+    const ay = y.unconfirmed > 0 ? -1 : activity(y).rank;
     return ax - ay || x.display_name.localeCompare(y.display_name);
   });
 }
@@ -433,8 +707,35 @@ function pct(n) { return Math.max(0, Math.min(100, Number(n) || 0)); }
 
 function fillClass(usedPct) { return usedPct >= 90 ? 'bad' : usedPct >= 70 ? 'warn' : ''; }
 
+// Context window bands: under 30% calm, 30 to 60% normal, 60 to 80% warning, 80% and up critical.
+function ctxBand(p) { return p >= 80 ? 'bad' : p >= 60 ? 'warn' : p >= 30 ? '' : 'ok'; }
+
+// A 14 px ring for the context window, colored by band; the exact value is in the label.
+function ctxRing(p) {
+  const v = pct(p);
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const circ = 2 * Math.PI * 6;
+  [['ring-track', circ], ['ring-fill', circ * v / 100]].forEach(([cls, len]) => {
+    const c = document.createElementNS(SVG_NS, 'circle');
+    c.setAttribute('class', cls);
+    c.setAttribute('cx', '8'); c.setAttribute('cy', '8'); c.setAttribute('r', '6');
+    c.setAttribute('fill', 'none'); c.setAttribute('stroke', 'currentColor'); c.setAttribute('stroke-width', '2.6');
+    c.setAttribute('stroke-dasharray', `${len.toFixed(2)} ${circ.toFixed(2)}`);
+    c.setAttribute('transform', 'rotate(-90 8 8)');
+    if (cls === 'ring-fill') c.setAttribute('stroke-linecap', v > 0 ? 'round' : 'butt');
+    svg.append(c);
+  });
+  return h('span', { class: 'ctx-ring ' + (ctxBand(v) || 'mid'), role: 'img', title: `Context window ${Math.round(v)}% used`,
+    'aria-label': `Context window ${Math.round(v)}% used`, 'data-pct': Math.round(v) }, svg);
+}
+
 function meter(label, used, valueText, opts) {
-  const fill = h('span', { class: 'fill ' + ((opts && opts.cls) || fillClass(used)) });
+  const fill = h('span', { class: 'fill ' + ((opts && opts.cls != null) ? opts.cls : fillClass(used)) });
   fill.style.width = pct(used) + '%';
   const name = label || (opts && opts.name) || '';
   return h('div', { class: 'meter' + (label ? '' : ' no-label') }, label ? h('span', { class: 'muted', text: label }) : null,
@@ -442,17 +743,18 @@ function meter(label, used, valueText, opts) {
     h('span', { class: 'val', text: valueText }));
 }
 
-function miniMeter(label, used) {
+function miniMeter(label, used, gb) {
   const fill = h('span', { class: 'fill ' + fillClass(used) });
   fill.style.width = pct(used) + '%';
-  return h('span', { class: 'mini-meter' }, h('span', { text: `${label} ${Math.round(pct(used))}%` }),
-    h('span', { class: 'track' }, fill));
+  return h('span', { class: 'mini-meter' },
+    h('span', { class: 'mm-top' }, h('span', { text: label }), h('span', { class: 'tnum', text: `${Math.round(pct(used))}%` })),
+    h('span', { class: 'track', role: 'img', 'aria-label': `${label} ${Math.round(pct(used))}% used` }, fill),
+    gb ? h('span', { class: 'rail-gb', text: gb }) : null);
 }
 
 function agentRow(a) {
   const p = a.presence || {};
   const st = p.status || {};
-  const act = activity(a);
   const consul = a.role === 'consul';
   const expanded = S.view.expandedAgentIds.includes(a.id);
   const detailsId = 'agent-details-' + a.id;
@@ -462,25 +764,30 @@ function agentRow(a) {
   if (a.waiting) extras.push(`${a.waiting} waiting`);
   if (a.unconfirmed) extras.push(`${a.unconfirmed} unconfirmed`);
   if (conv && conv.unread_count) extras.push(`${conv.unread_count} unread`);
+  if (isMuted(a.id)) extras.push('muted');
   if (!extras.length) extras.push(p.online ? 'online' : `last seen ${ago(p.last_checkin_at)}`);
+  const ctx = typeof st.context_pct === 'number' ? ctxRing(st.context_pct) : null;
 
   const main = h('button', { type: 'button', class: 'agent-main', 'aria-expanded': String(expanded),
     'aria-controls': detailsId, onclick: () => { toggleIn(S.view.expandedAgentIds, a.id); renderAgents(); } },
     avatar(a, 'md', { status: a.status === 'admitted' ? (p.online ? 'on' : 'off') : null, consul }),
     h('span', { class: 'agent-text' },
       h('span', { class: 'agent-line1' },
-        h('span', { class: 'agent-name', text: a.display_name }),
+        h('span', { class: 'agent-name', title: a.display_name, text: a.display_name }),
+        p.provider ? prov(p.provider, 13, null) : null,
         h('span', { class: 'agent-handle', text: '@' + a.handle }),
         consul ? h('span', { class: 'pill consul', text: 'Consul' }) : null),
       h('span', { class: 'agent-line2' },
-        h('span', { class: 'pill ' + act.cls, title: act.title || null, text: act.label }),
-        h('span', { class: 'agent-extra', text: extras.join(', ') }))),
+        a.hold ? h('span', { class: 'pill hold', title: `Held${a.hold.reason ? ': ' + a.hold.reason : ''}`, text: 'held' }) : null,
+        statusPill(a),
+        ctx,
+        h('span', { class: 'agent-extra', title: extras.join(', '), text: extras.join(', ') }))),
     h('span', { class: 'agent-chev', 'aria-hidden': 'true' }, icon('chevron', 14)));
 
   const row = h('div', { class: 'agent-row' }, main,
     a.status === 'admitted' ? h('button', { type: 'button', class: 'agent-chat ghost',
       'aria-label': `Chat with ${a.display_name}`, onclick: (ev) => { ev.stopPropagation(); openWith(a); } }, 'Chat') : null);
-  const wrap = h('div', { class: 'agent' + (consul ? ' is-consul' : ''), 'data-agent-id': a.id }, row);
+  const wrap = h('div', { class: 'agent' + (consul ? ' is-consul' : '') + (a.hold ? ' is-held' : ''), 'data-agent-id': a.id }, row);
   if (expanded) wrap.append(agentDetails(a, detailsId));
   return wrap;
 }
@@ -488,49 +795,54 @@ function agentRow(a) {
 function agentDetails(a, id) {
   const p = a.presence || {};
   const st = p.status || {};
+  const act = activity(a);
   const modes = (p.modes || ['queue']).map((m) => (m === 'jump' ? 'Jump queue' : 'Queue')).join(', ');
   const kv = h('dl', { class: 'kv' });
   const add = (k, v) => kv.append(h('dt', { text: k }), h('dd', {}, v));
+  add('Status', [statusPill(a), p.effective_since ? h('span', { class: 'muted' }, ' since ', agoNode(p.effective_since)) : null]);
   add('Last check-in', agoNode(p.last_checkin_at));
-  add('Context', typeof st.context_pct === 'number' ? meter('', st.context_pct, Math.round(st.context_pct) + '%', { name: 'Context used' })
-    : 'unknown');
-  add('Runtime', [p.provider, p.runtime, p.connector].filter(Boolean).join(' / ') || 'unknown');
+  add('Context', typeof st.context_pct === 'number'
+    ? meter('', st.context_pct, Math.round(st.context_pct) + '%', { name: 'Context used', cls: ctxBand(st.context_pct) }) : 'unknown');
+  add('Runtime', [p.provider ? prov(p.provider, 14) : null, ' ',
+    [providerName(p.provider), p.runtime, p.connector].filter(Boolean).join(' / ') || 'unknown']);
   add('Delivery', modes);
   add('Images', supportsImages(a) ? 'accepted' : 'text only');
   add('Queue', `${a.waiting || 0} waiting, ${a.unconfirmed || 0} unconfirmed`);
   add('Stream', st.attached === false ? 'not attached' : st.attached ? 'attached' : 'unknown');
+  if (a.hold) add('Hold', [`since ${fullTime(a.hold.since)}`, a.hold.reason ? `, ${a.hold.reason}` : '']);
   add('Handle', '@' + a.handle);
-  add('Host', p.host || 'unknown');
+  add('Host', p.host ? hostName(p.host) : 'unknown');
   add('Address', a.address || 'unknown');
+  void act;
 
   const pools = (S.board.pools || []);
   const poolSel = h('select', { 'aria-label': `Pool for ${a.display_name}`, onchange: (ev) => setPool(a, ev.target.value) },
     h('option', { value: '', text: 'No pool' }),
     ...pools.map((pl) => h('option', { value: pl.id, selected: a.pool && a.pool.id === pl.id,
       text: `${providerName(pl.provider)}: ${pl.label}` })));
+  const muted = isMuted(a.id);
   const actions = h('div', { class: 'agent-actions' });
   if (a.status === 'admitted') {
     actions.append(
       h('button', { type: 'button', class: 'primary', onclick: () => openWith(a) }, 'Message'),
-      h('button', { type: 'button', class: 'danger', onclick: () => revoke(a) }, 'Revoke'),
-      h('button', { type: 'button', class: 'ghost', disabled: true, title: 'Recovery is planned for a later version' }, 'Recover'));
+      a.hold ? h('button', { type: 'button', class: 'ghost', onclick: () => setHold(a, false) }, 'Resume delivery')
+        : h('button', { type: 'button', class: 'ghost', title: 'Stop handing it new messages without revoking access',
+          onclick: () => setHold(a, true) }, 'Hold delivery'),
+      h('button', { type: 'button', class: 'ghost', 'aria-pressed': String(muted),
+        onclick: () => { toggleIn(S.view.mutedAgentIds, a.id); renderAgents(); } }, muted ? 'Unmute' : 'Mute notifications'),
+      h('button', { type: 'button', class: 'danger', onclick: () => revoke(a) }, 'Revoke'));
   } else {
     actions.append(h('button', { type: 'button', class: 'ghost', onclick: () => readmit(a) }, 'Re-admit'));
   }
   return h('div', { class: 'agent-details', id },
     kv,
+    a.hold ? h('p', { class: 'hold-note', text: 'Delivery is held: messages wait on the server until you resume.' }) : null,
     h('label', {}, a.pool && a.pool.is_reporter ? 'Pool (usage reporter)' : 'Pool', poolSel),
     actions);
 }
 
-function providerName(p) {
-  const s = String(p || 'other');
-  const known = { openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google', moonshot: 'Moonshot',
-    deepseek: 'DeepSeek', xai: 'xAI', lyra: 'Lyra' };
-  return known[s.toLowerCase()] || s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-function hostLabel(name) { return String(name || '').replace(/\.local$/, ''); }
+function hostRow(host) { return ((S.board && S.board.hosts) || []).find((x) => x.host === host) || null; }
+function hostName(host) { const r = hostRow(host); return (r && r.display_name) || host.replace(/\.local$/, ''); }
 
 function railGroup(card, agents, details, offline) {
   const g = h('div', { class: 'rail-group' + (offline ? ' is-offline' : '') }, card,
@@ -540,43 +852,53 @@ function railGroup(card, agents, details, offline) {
   return g;
 }
 
+function hostMem(m) {
+  const total = m.mem_total_gb;
+  const used = m.mem_used_gb != null ? m.mem_used_gb : (total != null && m.mem_free_gb != null ? total - m.mem_free_gb : null);
+  const p = typeof m.mem_used_pct === 'number' ? m.mem_used_pct : (total && used != null ? 100 * used / total : null);
+  return { p, gb: used != null && total ? `${fmtGB(used)} / ${fmtGB(total)} GB` : null };
+}
+
+function hostDisk(m) {
+  const total = m.disk_total_gb;
+  const used = total != null && m.disk_free_gb != null ? total - m.disk_free_gb : null;
+  const p = typeof m.disk_used_pct === 'number' ? m.disk_used_pct : (total && used != null ? 100 * used / total : null);
+  return { p, gb: used != null && total ? `${fmtGB(used)} / ${fmtGB(total)} GB` : null };
+}
+
 function renderByMachine(root, admitted) {
   const hosts = (S.board.hosts || []).slice().sort((x, y) =>
-    (y.online_count > 0) - (x.online_count > 0) || String(x.host).localeCompare(String(y.host)));
+    (y.online_count > 0) - (x.online_count > 0) || String(x.display_name || x.host).localeCompare(String(y.display_name || y.host)));
   const placed = new Set();
   for (const host of hosts) {
     const agents = attentionSort(host.agent_ids.map(agentById).filter((a) => a && a.status === 'admitted'));
     agents.forEach((a) => placed.add(a.id));
     const m = host.metrics || {};
+    const mem = hostMem(m);
+    const disk = hostDisk(m);
     const expanded = S.view.expandedMachineIds.includes(host.host);
-    const memPct = typeof m.mem_used_pct === 'number' ? m.mem_used_pct
-      : (m.mem_total_gb ? 100 * (m.mem_used_gb || (m.mem_total_gb - (m.mem_free_gb || 0))) / m.mem_total_gb : null);
-    const diskPct = typeof m.disk_used_pct === 'number' ? m.disk_used_pct
-      : (m.disk_total_gb ? 100 * (1 - (m.disk_free_gb || 0) / m.disk_total_gb) : null);
+    const name = host.display_name || host.host;
+    const aliased = name !== host.host;
     const detailsId = 'host-details-' + host.host.replace(/[^a-zA-Z0-9_-]/g, '_');
     const card = h('button', { type: 'button', class: 'rail-card', 'aria-expanded': String(expanded),
-      'aria-controls': detailsId, title: host.host,
-      onclick: () => { toggleIn(S.view.expandedMachineIds, host.host); renderAgents(); } },
-      h('span', { class: 'rail-name' }, hostLabel(host.host)),
+      'aria-controls': detailsId, 'data-host': host.host, 'aria-haspopup': 'menu',
+      title: aliased ? `${name} (${host.host}). Right-click to rename.` : `${host.host}. Right-click to rename.`,
+      onclick: () => { toggleIn(S.view.expandedMachineIds, host.host); renderAgents(); },
+      oncontextmenu: (ev) => openHostMenu(ev, host) },
+      h('span', { class: 'rail-name', text: aliased ? name : name.replace(/\.local$/, '') }),
       h('span', { class: 'rail-sub', text: `${host.online_count} of ${agents.length} online` }),
       m.os ? h('span', { class: 'rail-sub', text: [m.os, m.arch].filter(Boolean).join(' ') }) : null,
-      memPct != null ? miniMeter('RAM', memPct) : null,
-      diskPct != null ? miniMeter('Disk', diskPct) : null,
+      mem.p != null ? miniMeter('RAM', mem.p, mem.gb) : null,
+      disk.p != null ? miniMeter('Disk', disk.p, disk.gb) : null,
       h('span', { class: 'rail-chev', text: expanded ? 'Hide details' : 'Details' }));
     let details = null;
     if (expanded) {
       details = h('div', { class: 'rail-details', id: detailsId });
-      if (memPct != null) {
-        const used = m.mem_used_gb != null ? m.mem_used_gb : (m.mem_total_gb && m.mem_free_gb != null ? m.mem_total_gb - m.mem_free_gb : null);
-        details.append(meter('RAM', memPct, used != null && m.mem_total_gb
-          ? `${fmtNum(used, 1)} / ${fmtNum(m.mem_total_gb, 0)} GB` : `${Math.round(memPct)}%`));
-      }
-      if (diskPct != null) {
-        details.append(meter('Disk', diskPct, m.disk_free_gb != null && m.disk_total_gb
-          ? `${fmtNum(m.disk_free_gb, 0)} GB free of ${fmtNum(m.disk_total_gb, 0)}` : `${Math.round(diskPct)}% used`));
-      }
+      if (mem.p != null) details.append(meter('RAM', mem.p, mem.gb || `${Math.round(mem.p)}%`));
+      if (disk.p != null) details.append(meter('Disk', disk.p, disk.gb || `${Math.round(disk.p)}% used`));
       const kv = h('dl', { class: 'kv' });
       const add = (k, v) => { if (v != null && v !== '') kv.append(h('dt', { text: k }), h('dd', {}, v)); };
+      add('Host name', host.host);
       add('System', [m.os, m.arch].filter(Boolean).join(', '));
       add('CPU cores', m.cpu_count != null ? String(m.cpu_count) : null);
       add('Address', m.ip);
@@ -587,6 +909,9 @@ function renderByMachine(root, admitted) {
         details.append(h('span', { class: 'stale-note', text: 'Telemetry is stale (no check-in for over 10 minutes).' }));
       }
       if (!Object.keys(m).length) details.append(h('p', { class: 'muted', text: 'No telemetry reported for this host yet.' }));
+      details.append(h('div', { class: 'rail-actions' },
+        h('button', { type: 'button', class: 'ghost', onclick: () => openHostDialog(host) }, 'Rename machine'),
+        aliased ? h('button', { type: 'button', class: 'quiet', onclick: () => saveHostAlias(host.host, null) }, 'Use the host name') : null));
     }
     root.append(railGroup(card, agents, details, host.online_count === 0));
   }
@@ -599,6 +924,8 @@ function renderByMachine(root, admitted) {
 }
 
 function uptime(sec) {
+  if (sec < 60) return 'under a minute';
+  if (sec < 3600) return `${Math.floor(sec / 60)} min`;
   const d = Math.floor(sec / 86400);
   const hrs = Math.floor((sec % 86400) / 3600);
   return d ? `${d} d ${hrs} h` : `${hrs} h ${Math.floor((sec % 3600) / 60)} min`;
@@ -627,7 +954,7 @@ function renderByProvider(root, admitted) {
   const pools = S.board.pools || [];
   const byProvider = new Map();
   const ensure = (key) => {
-    const k = String(key || 'other').toLowerCase();
+    const k = MOD.brand ? MOD.brand.key(key) : String(key || 'other').toLowerCase();
     if (!byProvider.has(k)) byProvider.set(k, { pools: [], unpooled: [] });
     return byProvider.get(k);
   };
@@ -639,10 +966,10 @@ function renderByProvider(root, admitted) {
     const agentsIn = (pool) => attentionSort(admitted.filter((a) => a.pool && a.pool.id === pool.id));
     const activeCount = admitted.filter((a) => (a.pool ? group.pools.some((p) => p.id === a.pool.id) : group.unpooled.includes(a))
       && a.presence.online).length;
-    const section = h('section', { class: 'provider-section' },
+    const section = h('section', { class: 'provider-section', 'data-provider': key },
       h('button', { type: 'button', class: 'provider-head quiet', 'aria-expanded': String(!isCollapsed),
         onclick: () => { toggleIn(S.view.expandedProviderIds, key); renderAgents(); } },
-        h('strong', { text: providerName(key) }),
+        h('span', { class: 'ph-name' }, prov(key, 18), providerName(key)),
         h('span', { class: 'muted tnum', text: `${group.pools.length} account${group.pools.length === 1 ? '' : 's'}, ${activeCount} online` })));
     if (!isCollapsed) {
       for (const pool of group.pools) section.append(poolGroup(pool, agentsIn(pool)));
@@ -654,18 +981,27 @@ function renderByProvider(root, admitted) {
     }
     root.append(section);
   }
-  if (!byProvider.size) root.append(h('p', { class: 'list-empty', text: 'No account pools yet. Add one in Admin & Senate.' }));
+  if (!byProvider.size) root.append(h('p', { class: 'list-empty', text: 'No account pools yet. Add one in Senate.' }));
 }
+
+function norm(v) { return String(v || '').trim().toLowerCase().replace(/\s+/g, ' '); }
 
 function poolGroup(pool, agents) {
   const expanded = S.view.expandedPoolIds.includes(pool.id);
   const rem = poolRemaining(pool);
   const detailsId = 'pool-details-' + pool.id;
-  const card = h('button', { type: 'button', class: 'rail-card', 'aria-expanded': String(expanded), 'aria-controls': detailsId,
-    'data-pool-id': pool.id, onclick: () => { toggleIn(S.view.expandedPoolIds, pool.id); renderAgents(); } },
-    h('span', { class: 'rail-name', text: pool.label }),
-    pool.account_label ? h('span', { class: 'rail-sub', text: pool.account_label }) : null,
-    pool.subscription ? h('span', { class: 'pill info', text: pool.subscription }) : null,
+  // Show each distinct piece of metadata once: account and subscription often repeat the label.
+  const seen = new Set([norm(pool.label)]);
+  const distinct = (v) => { const k = norm(v); if (!k || seen.has(k)) return null; seen.add(k); return v; };
+  const account = distinct(pool.account_label);
+  const plan = distinct(pool.subscription);
+  const card = h('button', { type: 'button', class: 'rail-card pool-card', 'aria-expanded': String(expanded), 'aria-controls': detailsId,
+    'data-pool-id': pool.id, title: [pool.label, pool.account_label, pool.subscription].filter(Boolean)
+      .filter((v, i, arr) => arr.findIndex((x) => norm(x) === norm(v)) === i).join(', '),
+    onclick: () => { toggleIn(S.view.expandedPoolIds, pool.id); renderAgents(); } },
+    h('span', { class: 'rail-title' }, prov(pool.provider, 13), h('span', { class: 'rail-name', text: pool.label })),
+    account ? h('span', { class: 'rail-sub', text: account }) : null,
+    plan ? h('span', { class: 'pill info', text: plan }) : null,
     rem != null ? h('span', { class: 'pill ' + remClass(rem), text: `${Math.round(rem)}% left` })
       : h('span', { class: 'rail-sub', text: 'quota unknown' }),
     h('span', { class: 'rail-chev', text: expanded ? 'Hide details' : 'Details' }));
@@ -682,6 +1018,7 @@ function poolGroup(pool, agents) {
     if (!metrics.length) details.append(h('p', { class: 'muted', text: 'No usage reported yet.' }));
     const kv = h('dl', { class: 'kv' });
     const add = (k, v) => { if (v) kv.append(h('dt', { text: k }), h('dd', {}, v)); };
+    add('Provider', [prov(pool.provider, 14), ' ', providerName(pool.provider)]);
     add('Account', pool.account_label);
     add('Subscription', pool.subscription);
     add('Reporter', pool.reporter ? pool.reporter.display_name : 'none assigned');
@@ -703,12 +1040,67 @@ function renderQuotaAlert() {
     h('button', { type: 'button', onclick: () => {
       S.view.agentGroupMode = 'provider';
       if (!S.view.expandedPoolIds.includes(first.p.id)) S.view.expandedPoolIds.push(first.p.id);
-      const k = String(first.p.provider).toLowerCase();
+      const k = MOD.brand ? MOD.brand.key(first.p.provider) : String(first.p.provider).toLowerCase();
       S.view.expandedProviderIds = S.view.expandedProviderIds.filter((x) => x !== k);
       saveView(); renderAgents(); setTab('agents');
       const el = document.querySelector(`[data-pool-id="${first.p.id}"]`);
       if (el) el.scrollIntoView({ block: 'nearest' });
     } }, 'Show pool'));
+}
+
+// --- Needs you ----------------------------------------------------------------
+
+function noteFailed(convId) {
+  const c = S.convs.find((x) => x.id === convId);
+  const a = c && c.kind === 'owner_agent' ? convAgents(c)[0] : null;
+  if (a) S.failed.set(a.id, { at: now(), convId });
+}
+
+function computeNeeds() {
+  const out = [];
+  const t = now();
+  for (const [id, f] of S.failed) if (t - f.at > FAILED_WINDOW) S.failed.delete(id);
+  for (const a of ((S.board && S.board.agents) || []).filter((x) => x.status === 'admitted')) {
+    const p = a.presence || {};
+    const since = p.effective_since || p.last_checkin_at || null;
+    if (p.effective_status === 'needs_input') out.push({ agent: a, kind: 'input', rank: 0, why: 'Waiting for your input', since });
+    else if (p.effective_status === 'stalled') out.push({ agent: a, kind: 'stalled', rank: 1, why: 'Stalled: busy with no activity', since });
+    if (!p.online && (a.waiting || a.unconfirmed)) {
+      out.push({ agent: a, kind: 'offline', rank: 2, why: `Offline with ${a.waiting || a.unconfirmed} message${(a.waiting || a.unconfirmed) === 1 ? '' : 's'} waiting`,
+        since: p.last_checkin_at });
+    } else if (a.unconfirmed) {
+      out.push({ agent: a, kind: 'unconfirmed', rank: 2, why: 'Delivery unconfirmed: check and retry', since });
+    }
+    const f = S.failed.get(a.id);
+    if (f) out.push({ agent: a, kind: 'failed', rank: 3, why: 'A message to it failed', since: f.at });
+  }
+  // One entry per agent: the most urgent reason leads, the others follow.
+  const byAgent = new Map();
+  for (const n of out.sort((x, y) => x.rank - y.rank || (x.since || 0) - (y.since || 0))) {
+    const e = byAgent.get(n.agent.id);
+    if (!e) byAgent.set(n.agent.id, Object.assign({}, n, { kinds: [n.kind] }));
+    else { e.kinds.push(n.kind); e.why += `; ${n.why.charAt(0).toLowerCase()}${n.why.slice(1)}`; }
+  }
+  return Array.from(byAgent.values());
+}
+
+function renderNeeds() {
+  const box = clear($('needs'));
+  const items = S.needs;
+  box.hidden = !items.length;
+  if (!items.length) return;
+  box.append(h('div', { class: 'needs-head' },
+    h('h3', { id: 'needs-title' }, `Needs you (${items.length})`),
+    h('span', { class: 'muted note', text: 'N to step through' })));
+  for (const n of items) {
+    box.append(h('button', { type: 'button', class: 'needs-item', 'data-agent-id': n.agent.id, 'data-kind': n.kind,
+      'data-kinds': n.kinds.join(' '), title: `${n.agent.display_name}: ${n.why}`,
+      onclick: () => openWith(n.agent) },
+      avatar(n.agent, 'sm', { consul: n.agent.role === 'consul' }),
+      h('span', { class: 'needs-text' }, h('span', { class: 'needs-name', text: n.agent.display_name }),
+        h('span', { class: 'needs-why', text: n.why })),
+      n.since ? agoNode(n.since) : null));
+  }
 }
 
 function renderAgents() {
@@ -718,11 +1110,14 @@ function renderAgents() {
   $('agents-count').textContent = `${admitted.filter((a) => a.presence.online).length}/${admitted.length} online`;
   document.querySelectorAll('.seg-btn').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.group === S.view.agentGroupMode)));
   renderQuotaAlert();
-  const root = $('roster');
-  const keepScroll = root.scrollTop;
-  clear(root);
+  S.needs = computeNeeds();
+  notifyNeeds(S.needs);
+  renderNeeds();
+  const roster = $('roster');
+  const keepScroll = roster.scrollTop;
+  const root = clear($('roster-groups'));
   if (!agents.length) {
-    root.append(h('p', { class: 'list-empty', text: 'No agents yet. Create an invite in Admin & Senate.' }));
+    root.append(h('p', { class: 'list-empty', text: 'No agents yet. Create an invite in Senate.' }));
     return;
   }
   if (S.view.agentGroupMode === 'provider') renderByProvider(root, admitted);
@@ -732,7 +1127,7 @@ function renderAgents() {
     root.append(h('div', { class: 'group-title' }, 'Revoked', h('span', { class: 'tnum', text: String(revoked.length) })),
       h('div', { class: 'rail-group single' }, h('div', { class: 'rail-agents' }, revoked.map(agentRow))));
   }
-  root.scrollTop = keepScroll;
+  roster.scrollTop = keepScroll;
 }
 
 document.querySelectorAll('.seg-btn').forEach((b) => b.addEventListener('click', () => {
@@ -758,7 +1153,7 @@ async function revoke(a) {
 async function readmit(a) {
   try {
     const r = await api('POST', '/api/v1/admin/invites', { target_principal_id: a.id });
-    setTab('admin-senate');
+    setTab('senate');
     showCode(r.code, a.display_name);
     schedule({ board: true });
   } catch (e) { window.alert(e.message); }
@@ -768,6 +1163,92 @@ async function setPool(a, value) {
   try { await api('PATCH', `/api/v1/admin/principals/${a.id}`, { pool_id: value === '' ? null : Number(value) }); schedule({ board: true }); }
   catch (e) { window.alert(e.message); }
 }
+
+async function setHold(a, hold) {
+  try {
+    if (hold) await api('POST', `/api/v1/admin/principals/${a.id}/hold`, { reason: 'paused by the owner' });
+    else await api('DELETE', `/api/v1/admin/principals/${a.id}/hold`);
+    schedule({ board: true });
+  } catch (e) { window.alert(e.message); }
+}
+
+// --- machine aliases: right-click menu and rename dialog -------------------------
+
+function openHostMenu(ev, host) {
+  ev.preventDefault();
+  const menu = $('host-menu');
+  S.menuHost = host;
+  menu.querySelector('[data-act="clear"]').hidden = !(host.display_name && host.display_name !== host.host);
+  menu.hidden = false;
+  const r = ev.currentTarget.getBoundingClientRect();
+  const x = ev.clientX || r.left + 12;
+  const y = ev.clientY || r.top + 12;
+  const w = menu.offsetWidth; const hgt = menu.offsetHeight;
+  menu.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + 'px';
+  menu.style.top = Math.max(8, Math.min(y, window.innerHeight - hgt - 8)) + 'px';
+  menu.querySelector('button:not([hidden])').focus();
+}
+
+function closeHostMenu(restoreFocus) {
+  const menu = $('host-menu');
+  if (menu.hidden) return;
+  menu.hidden = true;
+  if (restoreFocus && S.menuHost) {
+    const card = document.querySelector(`.rail-card[data-host="${CSS.escape(S.menuHost.host)}"]`);
+    if (card) card.focus();
+  }
+}
+
+$('host-menu').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button[data-act]');
+  if (!b || !S.menuHost) return;
+  const host = S.menuHost;
+  closeHostMenu(false);
+  if (b.dataset.act === 'rename') openHostDialog(host);
+  else if (b.dataset.act === 'clear') saveHostAlias(host.host, null);
+  else if (b.dataset.act === 'details') {
+    if (!S.view.expandedMachineIds.includes(host.host)) toggleIn(S.view.expandedMachineIds, host.host);
+    renderAgents();
+  }
+});
+$('host-menu').addEventListener('keydown', (ev) => {
+  const items = Array.from($('host-menu').querySelectorAll('button:not([hidden])'));
+  const i = items.indexOf(document.activeElement);
+  if (ev.key === 'Escape') { ev.preventDefault(); closeHostMenu(true); }
+  else if (ev.key === 'ArrowDown') { ev.preventDefault(); items[(i + 1) % items.length].focus(); }
+  else if (ev.key === 'ArrowUp') { ev.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  else if (ev.key === 'Tab') closeHostMenu(false);
+});
+document.addEventListener('pointerdown', (ev) => { if (!ev.target.closest('#host-menu')) closeHostMenu(false); });
+window.addEventListener('resize', () => closeHostMenu(false));
+$('roster').addEventListener('scroll', () => closeHostMenu(false), { passive: true });
+
+let editingHost = null;
+function openHostDialog(host) {
+  editingHost = host;
+  $('host-dialog-host').textContent = `Host name: ${host.host}`;
+  $('host-alias').value = host.display_name && host.display_name !== host.host ? host.display_name : '';
+  $('host-error').textContent = '';
+  $('host-dialog').showModal();
+  $('host-alias').focus();
+}
+
+async function saveHostAlias(host, name) {
+  try {
+    await api('PUT', `/api/v1/admin/hosts/${encodeURIComponent(host)}`, { display_name: name && name.trim() ? name.trim() : null });
+    schedule({ board: true });
+    return true;
+  } catch (e) {
+    if ($('host-dialog').open) $('host-error').textContent = e.message; else window.alert(e.message);
+    return false;
+  }
+}
+
+$('host-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  if (!editingHost) return;
+  if (await saveHostAlias(editingHost.host, $('host-alias').value)) $('host-dialog').close();
+});
 
 // =============================================================================
 // Conversations: pins, unread badges, read receipts
@@ -782,12 +1263,18 @@ function convTitle(c) {
   return c.kind === 'agent_agent' ? names.join(' and ') : (names[0] || 'Conversation');
 }
 
-function renderUnreadTotals() {
-  const total = S.convs.reduce((n, c) => n + (c.unread_count || 0), 0);
+function renderTitle() {
+  const unread = S.convs.reduce((n, c) => n + (c.unread_count || 0), 0);
+  const needs = S.needs.length;
   const badge = $('tab-unread');
-  badge.hidden = !total;
-  badge.textContent = total > 99 ? '99+' : String(total);
-  badge.setAttribute('aria-label', `${total} unread`);
+  badge.hidden = !unread;
+  badge.textContent = unread > 99 ? '99+' : String(unread);
+  badge.setAttribute('aria-label', `${unread} unread`);
+  const nb = $('tab-needs');
+  nb.hidden = !needs;
+  nb.textContent = String(needs);
+  nb.setAttribute('aria-label', `${needs} need you`);
+  const total = unread + needs;      // everything waiting on the owner
   document.title = total ? `(${total > 99 ? '99+' : total}) Lyra` : 'Lyra';
 }
 
@@ -864,7 +1351,7 @@ function maybeMarkRead() {
   S.readInFlight[c.id] = latest;
   c.unread_count = 0;
   c.last_read_message_id = latest;
-  renderConvList(); renderUnreadTotals(); renderAgents();
+  renderConvList(); renderTitle(); renderAgents();
   api('POST', `/api/v1/conversations/${c.id}/read`, { last_read_message_id: latest })
     .catch(() => { delete S.readInFlight[c.id]; });
 }
@@ -873,7 +1360,7 @@ document.addEventListener('visibilitychange', maybeMarkRead);
 window.addEventListener('focus', maybeMarkRead);
 
 // =============================================================================
-// Thread
+// Thread: bubbles, compact receipts, the live agent-side bubble
 // =============================================================================
 
 function draftKey() {
@@ -887,7 +1374,7 @@ function leaveConv() {
   S.navigation++;
   S.staged = [];
   S.replyTo = null;
-  S.lifeNodes.clear();
+  S.receiptNodes.clear();
   $('compose-files').value = '';
   $('compose-error').textContent = '';
   $('new-pill').hidden = true;
@@ -929,6 +1416,10 @@ async function reloadConv(opts) {
     const before = S.msgs.length ? S.msgs[S.msgs.length - 1].id : 0;
     S.msgs = r.messages || [];
     S.optimistic = S.optimistic.filter((o) => !S.msgs.some((m) => m.client_msg_id && m.client_msg_id === o.client_msg_id));
+    for (const m of S.msgs) {
+      if (m.state === 'failed' && m.recipient && m.recipient.kind === 'agent' && m.failed_at && now() - m.failed_at < FAILED_WINDOW
+        && !S.failed.has(m.recipient.id)) S.failed.set(m.recipient.id, { at: m.failed_at, convId: id });
+    }
     const after = S.msgs.length ? S.msgs[S.msgs.length - 1].id : 0;
     renderThreadHeader();
     renderMessages({ toBottom: opts && opts.toBottom, grew: after > before });
@@ -999,18 +1490,24 @@ function renderThreadHeader() {
   if (!a) { head.append(h('span', { class: 'muted', text: 'Conversation' })); return; }
   const consul = a.role === 'consul';
   if (consul) head.classList.add('is-consul');
-  const act = activity(a);
-  head.append(avatar(a, 'md', { status: a.status === 'admitted' ? (a.presence && a.presence.online ? 'on' : 'off') : null, consul }),
+  const p = a.presence || {};
+  head.append(avatar(a, 'md', { status: a.status === 'admitted' ? (p.online ? 'on' : 'off') : null, consul }),
     h('div', { class: 'conv-who' },
       h('div', { class: 'who-name' }, h('span', { text: a.display_name }),
         consul ? h('span', { class: 'pill consul', text: 'Consul' }) : null,
-        h('span', { class: 'pill ' + act.cls, text: act.label })),
-      h('div', { class: 'who-sub', text: a.presence && a.presence.online
-        ? `@${a.handle}, ${(a.presence.modes || []).includes('jump') ? 'queue and jump queue' : 'queue only'}`
-        : `@${a.handle}, offline: messages wait until it reconnects` })));
+        a.hold ? h('span', { class: 'pill hold', text: 'held' }) : null,
+        statusPill(a)),
+      h('div', { class: 'who-sub', text: [`@${a.handle}`, p.provider ? providerName(p.provider) : null,
+        p.online ? ((p.modes || []).includes('jump') ? 'queue and jump queue' : 'queue only')
+          : 'offline: messages wait until it reconnects'].filter(Boolean).join(', ') })));
 }
 
 function nearBottom(box) { return box.scrollHeight - box.scrollTop - box.clientHeight <= 48; }
+
+function receiptHandlers(m) {
+  if (m.local === 'send_failed') return { onRetrySend: retrySend, onDiscard: discardSend };
+  return { onCancel: cancelMessage, onRetryDelivery: retryDelivery, onDetails: showDetails };
+}
 
 function messageNode(m, ctx) {
   const mine = m.sender && (m.sender.kind === 'owner' || m.sender.id === ownerId());
@@ -1027,20 +1524,18 @@ function messageNode(m, ctx) {
   const bubble = h('div', { class: 'bubble' }, head,
     m.reply_to ? h('div', { class: 'quote', text: `${m.reply_to.sender_name}: ${m.reply_to.excerpt}` }) : null,
     m.body ? h('div', { class: 'msg-body' }, renderBody(m.body)) : null,
-    h('div', { class: 'image-strip' }, (m.attachments || []).map(thumb)));
+    h('div', { class: 'image-strip' }, (m.attachments || []).map((img) => thumb(img))));
   const foot = h('div', { class: 'msg-foot' });
   if (mine && m.recipient && m.recipient.kind === 'agent' && MOD.life) {
-    const handlers = {};
-    if (m.local === 'send_failed') { handlers.onRetrySend = retrySend; handlers.onDiscard = discardSend; }
-    else if (m.state === 'unconfirmed') handlers.onRetryDelivery = retryDelivery;
-    const life = MOD.life.render(m, { replied: MOD.life.replied(m, ctx.msgs), now: now() }, handlers);
-    if (m.id != null) S.lifeNodes.set(m.id, { el: life, handlers });
-    foot.append(life);
+    const handlers = receiptHandlers(m);
+    const rc = MOD.life.renderReceipt(m, { replied: MOD.life.replied(m, ctx.msgs) }, handlers);
+    if (m.id != null) S.receiptNodes.set(m.id, { el: rc, handlers });
+    foot.append(rc);
   } else if (team && m.state && m.state !== 'delivered') {
     foot.append(h('span', { class: 'msg-state ' + m.state, text: m.state === 'waiting' ? 'waiting' : m.state === 'failed'
       ? `failed: ${m.state_reason || 'delivery failed'}` : m.state }));
   }
-  if (!S.conv.read_only && !team && m.id != null && !m.local) {
+  if (!mine && !S.conv.read_only && !team && m.id != null && !m.local) {
     foot.append(h('button', { type: 'button', class: 'quiet', onclick: () => { S.replyTo = m; saveDraft(); renderComposer();
       $('compose-body').focus(); } }, 'Reply'));
   }
@@ -1051,9 +1546,28 @@ function messageNode(m, ctx) {
   return node;
 }
 
-function thumb(image) {
+// Placeholder response from the agent: avatar, animated status, steps and elapsed time.
+function liveNode(m, ctx) {
+  if (!MOD.life) return null;
+  const agent = agentById(m.recipient.id) || m.recipient;
+  const lctx = { replied: MOD.life.replied(m, ctx.msgs), agentStatus: agent.presence && agent.presence.effective_status };
+  const info = MOD.life.live(m, lctx);
+  if (!info) return null;
+  const body = MOD.life.renderLive(m, lctx);
+  const consul = agent.role === 'consul';
+  return h('div', { class: `msg live is-${info.phase}${info.stale ? ' is-stale' : ''}`, 'data-live-for': m.id },
+    avatar(agent, 'sm', { consul }),
+    h('div', { class: 'bubble', 'aria-label': `${agent.display_name} is responding` },
+      h('div', { class: 'msg-head' }, h('strong', { text: agent.display_name }),
+        h('span', { class: 'live-tag', text: info.phase === 'input_required' ? 'waiting for you' : 'live' })),
+      body));
+}
+
+function thumb(image, opts) {
   const url = '/api/v1/attachments/' + Number(image.id);
-  const img = h('img', { src: url, alt: image.filename || 'Image', loading: 'lazy', width: 120, height: 72 });
+  const img = h('img', { alt: image.filename || 'Image', loading: 'lazy', width: 120, height: 72 });
+  if (opts && opts.onError) img.addEventListener('error', opts.onError, { once: true });
+  img.src = url;
   if (MOD.pop) MOD.pop.enhance(img);
   return img;
 }
@@ -1064,7 +1578,7 @@ function renderMessages(opts) {
   const wasNear = nearBottom(box);
   const top = box.scrollTop;
   clear(box);
-  S.lifeNodes.clear();
+  S.receiptNodes.clear();
   if (!S.conv) {
     box.append(h('div', { class: 'conv-empty-state' }, h('div', {},
       h('h2', { class: 'pane-title', text: 'No conversation selected' }),
@@ -1080,6 +1594,14 @@ function renderMessages(opts) {
   }
   const ctx = { msgs: S.msgs };
   for (const m of all) box.append(messageNode(m, ctx));
+  if (S.conv.kind === 'owner_agent') {
+    for (const m of S.msgs) {
+      if (m.recipient && m.recipient.kind === 'agent' && m.progress) {
+        const n = liveNode(m, ctx);
+        if (n) box.append(n);
+      }
+    }
+  }
   if (o.toBottom || wasNear) {
     box.scrollTop = box.scrollHeight;
     $('new-pill').hidden = true;
@@ -1100,13 +1622,12 @@ $('new-pill').addEventListener('click', () => {
   setTimeout(maybeMarkRead, 300);
 });
 
-function refreshLifecycles() {
+function refreshLiveTimers() {
   if (!MOD.life) return;
   const t = now();
-  for (const m of S.msgs) {
-    const n = S.lifeNodes.get(m.id);
-    if (n) MOD.life.update(n.el, m, { replied: MOD.life.replied(m, S.msgs), now: t }, n.handlers);
-  }
+  document.querySelectorAll('.live-timer[data-since]').forEach((el) => {
+    el.textContent = MOD.life.clock(t - Number(el.getAttribute('data-since')));
+  });
 }
 
 async function retryDelivery(m) {
@@ -1115,8 +1636,72 @@ async function retryDelivery(m) {
   catch (e) { window.alert(e.message); }
 }
 
+async function cancelMessage(m) {
+  $('compose-error').textContent = '';
+  try {
+    await api('POST', `/api/v1/messages/${m.id}/cancel`, { reason: 'cancelled by the owner' });
+  } catch (e) {
+    $('compose-error').textContent = e.data && e.data.error === 'message_claimed'
+      ? 'Too late to cancel: the agent already picked up this message.' : `Could not cancel: ${e.message}`;
+  }
+  await reloadConv();
+  schedule({ board: true });
+}
+
+// --- Details: lifecycle timestamps and stage latency -----------------------------
+
+const DURATIONS = [['client_to_server', 'Browser to server'], ['server_to_claim', 'Server to claim'],
+  ['claim_to_agent_read', 'Claim to agent read'], ['agent_think_to_reply', 'Agent think to reply'],
+  ['total_round_trip', 'Total round trip']];
+
+async function showDetails(m) {
+  const body = clear($('lifecycle-body'));
+  body.append(h('p', { class: 'muted', text: 'Loading…' }));
+  $('lifecycle-title').textContent = 'Delivery details';
+  if (!$('lifecycle-dialog').open) $('lifecycle-dialog').showModal();
+  let r;
+  try { r = await api('GET', `/api/v1/messages/${m.id}/lifecycle`); }
+  catch (e) { clear(body).append(h('p', { class: 'error', text: e.message })); return; }
+  clear(body);
+  const stateCls = { delivered: 'ok', failed: 'bad', cancelled: '', unconfirmed: 'warn', waiting: 'info' }[r.state] || '';
+  body.append(h('div', { class: 'storage-head' },
+    h('span', { class: 'muted', text: `Message #${r.message_id}${m.body ? ': ' + m.body.slice(0, 60) : ''}` }),
+    h('span', { class: 'pill ' + stateCls, text: r.state })));
+  const steps = [['Sent from this browser', r.client_sent_at], ['Received by the server', r.server_received_at],
+    ['Claimed by the agent connector', r.first_claimed_at], ['Read by the agent', r.agent_read_at],
+    [r.progress_phase ? `Progress: ${r.progress_phase.replace('_', ' ')}` : 'Progress', r.progress_updated_at],
+    ['Reply received', r.replied_at]];
+  if (r.cancelled_at) steps.push(['Cancelled', r.cancelled_at]);
+  if (r.failed_at) steps.push(['Failed', r.failed_at]);
+  body.append(h('ol', { class: 'lc-steps' }, steps.map(([label, ts]) => h('li', { class: ts ? '' : 'is-missing' },
+    h('span', { text: label }),
+    ts ? h('time', { datetime: new Date(ts * 1000).toISOString(), title: fullTime(ts), text: preciseTime(ts) })
+      : h('span', { class: 'muted', text: 'not yet' })))));
+  const d = r.durations_ms || {};
+  const max = Math.max(1, ...DURATIONS.map(([k]) => d[k] || 0));
+  body.append(h('div', { class: 'dur', role: 'list', 'aria-label': 'Stage latency' },
+    DURATIONS.map(([k, label]) => {
+      const fill = h('span', { class: 'fill' + (k === 'total_round_trip' ? ' ok' : '') });
+      fill.style.width = (d[k] != null ? Math.max(1.5, 100 * d[k] / max) : 0) + '%';
+      return h('div', { class: 'dur-row' + (k === 'total_round_trip' ? ' is-total' : ''), role: 'listitem' },
+        h('span', { text: label }), h('span', { class: 'track' }, fill), h('span', { class: 'val', text: fmtMs(d[k]) }));
+    })));
+  const attempts = r.attempts || [];
+  body.append(h('h3', { text: `Delivery attempts (${attempts.length})` }));
+  if (attempts.length) {
+    body.append(h('table', { class: 'attempts' },
+      h('thead', {}, h('tr', {}, ['#', 'Claimed', 'Lease until', 'Outcome'].map((t) => h('th', { scope: 'col', text: t })))),
+      h('tbody', {}, attempts.map((a, i) => h('tr', {},
+        h('td', { text: String(i + 1) }), h('td', { text: preciseTime(a.claimed_at) }),
+        h('td', { text: preciseTime(a.lease_until) }),
+        h('td', { text: a.outcome ? `${a.outcome}${a.outcome_at ? ' at ' + preciseTime(a.outcome_at) : ''}` : 'open' }))))));
+  } else {
+    body.append(h('p', { class: 'muted', text: 'Not claimed by the agent yet.' }));
+  }
+}
+
 // =============================================================================
-// Composer: drafts, auto-grow, modes, images, sending
+// Composer: drafts with images, auto-grow, modes, sending
 // =============================================================================
 
 function restoreDraft() {
@@ -1126,16 +1711,19 @@ function restoreDraft() {
   S.replyTo = null;
   if (d && d.replyToId) S.replyTo = { id: d.replyToId, pending: true };
   S.draftMode = d ? d.mode : null;
-  $('draft-hint').textContent = d && d.text ? 'Draft restored' : '';
+  S.staged = d ? d.attachments.map((a) => ({ name: a.filename, image: a, restored: true })) : [];
+  $('draft-hint').textContent = d && (d.text || d.attachments.length) ? 'Draft restored' : '';
   autoGrow();
 }
 
 function saveDraft() {
   const key = draftKey();
   if (!key || !store) return;
+  const attachments = S.staged.filter((i) => i.image).map((i) => ({ id: i.image.id, filename: i.image.filename || i.name,
+    mime_type: i.image.mime_type, size_bytes: i.image.size_bytes }));
   store.drafts.save(key, { text: $('compose-body').value, replyToId: S.replyTo ? S.replyTo.id : null,
-    mode: $('compose-mode').value || 'queue' });
-  $('draft-hint').textContent = $('compose-body').value ? 'Draft saved' : '';
+    mode: $('compose-mode').value || 'queue', attachments });
+  $('draft-hint').textContent = $('compose-body').value || attachments.length ? 'Draft saved' : '';
 }
 
 function autoGrow() {
@@ -1183,24 +1771,36 @@ function renderComposer() {
   autoGrow();
 }
 
+function setAttachTip(text) {
+  $('compose-attach-tip').setAttribute('data-tip', text);
+  $('compose-attach').setAttribute('aria-label', text);
+}
+
 function renderImages() {
   const agent = recipientAgent();
   const allowed = supportsImages(agent);
   const note = $('compose-image-note');
-  note.hidden = allowed || !S.conv;
-  note.textContent = allowed ? '' : 'Image sending is disabled for this agent (text only).';
   const attach = $('compose-attach');
   attach.disabled = !allowed || S.sending;
-  attach.title = allowed ? 'Attach images' : 'Images disabled: this agent does not support image input';
-  if (!allowed && S.staged.length) S.staged = [];
+  setAttachTip(allowed ? 'Attach image' : 'Text only: this agent does not accept images');
+  // Staged or restored images stay in the draft; they just cannot be sent while images are off.
+  note.hidden = !(S.conv && !allowed && S.staged.length);
+  note.textContent = 'This agent does not accept images right now. Remove them or send when it does.';
   const strip = clear($('compose-attachments'));
   for (const item of S.staged) {
+    const onError = () => {             // an expired or deleted upload: prune it from the draft
+      if (!S.staged.includes(item)) return;
+      S.staged.splice(S.staged.indexOf(item), 1);
+      saveDraft();
+      renderImages();
+      $('compose-error').textContent = `${item.name} is no longer available and was removed from the draft.`;
+    };
     strip.append(h('div', { class: 'staged-image' },
-      item.image ? thumb(item.image) : h('span', { class: 'staged-uploading', text: 'Uploading…' }),
+      item.image ? thumb(item.image, { onError: item.restored ? onError : null }) : h('span', { class: 'staged-uploading', text: 'Uploading…' }),
       h('button', { type: 'button', class: 'remove', disabled: S.sending, 'aria-label': 'Remove ' + item.name,
-        onclick: () => { S.staged.splice(S.staged.indexOf(item), 1); renderImages(); } }, '×')));
+        onclick: () => { S.staged.splice(S.staged.indexOf(item), 1); saveDraft(); renderImages(); } }, '×')));
   }
-  $('compose-send').disabled = S.sending || S.staged.some((item) => !item.image)
+  $('compose-send').disabled = S.sending || S.staged.some((item) => !item.image) || (!allowed && S.staged.length > 0)
     || !($('compose-body').value.trim() || S.staged.length);
 }
 
@@ -1227,7 +1827,7 @@ async function stageImages(files) {
     staged.push(item);
     renderImages();
     api('POST', '/api/v1/attachments', file, { 'X-Filename': encodeURIComponent(file.name) })
-      .then((r) => { item.image = r.attachment; })
+      .then((r) => { item.image = r.attachment; if (staged === S.staged) saveDraft(); })
       .catch((e) => {
         if (staged === S.staged && staged.includes(item)) {
           staged.splice(staged.indexOf(item), 1);
@@ -1274,7 +1874,7 @@ $('composer').addEventListener('submit', (ev) => {
     && x.body === $('compose-body').value && !S.staged.length);
   if (failed) { retrySend(failed); return; }
   const entry = {
-    local: 'sending', id: null, client_msg_id: clientId(), body: $('compose-body').value,
+    local: 'sending', id: null, client_msg_id: clientId(), client_sent_at: now(), body: $('compose-body').value,
     attachment_ids: S.staged.map((item) => item.image.id),
     attachments: S.staged.map((item) => item.image),
     mode: $('compose-mode').value || 'queue', reply_to_id: S.replyTo ? S.replyTo.id : null,
@@ -1293,7 +1893,8 @@ async function sendEntry(entry) {
   S.sending = true;
   renderMessages({ toBottom: true });
   renderImages();
-  const payload = { body: entry.body, mode: entry.mode, attachment_ids: entry.attachment_ids, client_msg_id: entry.client_msg_id };
+  const payload = { body: entry.body, mode: entry.mode, attachment_ids: entry.attachment_ids,
+    client_msg_id: entry.client_msg_id, client_sent_at: entry.client_sent_at };
   try {
     const r = entry.reply_to_id
       ? await api('POST', `/api/v1/messages/${entry.reply_to_id}/reply`, payload)
@@ -1356,12 +1957,15 @@ function activeProject() {
   return list.find((p) => p.id === (S.view && S.view.activeProjectId)) || null;
 }
 
-function stateLabel(list, key) { const f = list.find((x) => x[0] === key); return f ? f[1] : key; }
-
-function taskPill(status) {
-  const cls = { done: 'ok', blocked: 'bad', in_review: 'info', in_progress: 'warn' }[status] || '';
-  return h('span', { class: 'pill ' + cls, text: stateLabel(TASK_STATES, status) });
+function findTask(id) {
+  for (const p of (S.board.projects || [])) {
+    const t = p.tasks.find((x) => x.id === id);
+    if (t) return t;
+  }
+  return null;
 }
+
+function stateLabel(list, key) { const f = list.find((x) => x[0] === key); return f ? f[1] : key; }
 
 function projectPill(status) {
   const cls = { active: 'ok', paused: 'warn', completed: 'info' }[status] || '';
@@ -1371,6 +1975,26 @@ function projectPill(status) {
 function avatarRow(people, size) {
   return h('span', { class: 'avatar-row' }, (people || []).slice(0, 6).map((p) => avatar(p, size || 'xs',
     { label: p.display_name, consul: p.role === 'consul' })));
+}
+
+function taskCounts(p) {
+  if (p.task_counts) return p.task_counts;
+  const c = { total: p.tasks.length };
+  TASK_STATES.forEach(([k]) => { c[k] = p.tasks.filter((t) => t.status === k).length; });
+  return c;
+}
+
+function countBar(counts) {
+  const bar = h('span', { class: 'count-bar', role: 'img', 'aria-label':
+    TASK_STATES.filter(([k]) => counts[k]).map(([k, l]) => `${counts[k]} ${l.toLowerCase()}`).join(', ') || 'No tasks' });
+  if (!counts.total) return bar;
+  for (const k of ['done', 'in_review', 'in_progress', 'blocked', 'cancelled']) {
+    if (!counts[k]) continue;
+    const seg = h('span', { class: 'cb-' + k, title: `${counts[k]} ${stateLabel(TASK_STATES, k).toLowerCase()}` });
+    seg.style.width = (100 * counts[k] / counts.total) + '%';
+    bar.append(seg);
+  }
+  return bar;
 }
 
 function renderProjects() {
@@ -1387,13 +2011,16 @@ function renderProjects() {
   const shown = projects.filter((p) => filter === 'all' || p.status === filter);
   if (!shown.length) list.append(h('p', { class: 'list-empty', text: projects.length ? 'No projects with this status.' : 'No projects yet.' }));
   for (const p of shown) {
-    const done = p.tasks.filter((t) => t.status === 'done').length;
+    const counts = taskCounts(p);
     list.append(h('button', { type: 'button', class: 'proj-card' + (S.view.activeProjectId === p.id ? ' active' : ''),
       onclick: () => { S.view.activeProjectId = p.id; S.view.projectView = 'detail'; saveView(); renderProjects(); renderTabs(); } },
       h('span', { class: 'proj-card-top' }, h('span', { class: 'proj-card-name', text: p.name }), projectPill(p.status)),
+      countBar(counts),
       h('span', { class: 'proj-card-foot' },
         h('span', { class: 'person' }, p.pm ? avatar(p.pm, 'xs') : null, p.pm ? p.pm.display_name : 'No manager'),
-        avatarRow(p.members), h('span', { class: 'tnum', text: `${done}/${p.tasks.length} done` }))));
+        avatarRow(p.members),
+        h('span', { class: 'tnum', text: `${counts.done || 0}/${counts.total - (counts.cancelled || 0)} done` +
+          (counts.blocked ? `, ${counts.blocked} blocked` : '') }))));
   }
   const detail = h('div', { class: 'proj-detail' });
   const p = activeProject();
@@ -1410,6 +2037,7 @@ function renderProjects() {
 
 function projectDetail(p) {
   const tf = S.view.taskStatusFilter;
+  const counts = taskCounts(p);
   const frag = document.createDocumentFragment();
   frag.append(h('div', { class: 'proj-head' },
     h('div', { class: 'proj-head-top' },
@@ -1420,28 +2048,32 @@ function projectDetail(p) {
     p.description ? h('div', { class: 'msg-body' }, renderBody(p.description)) : null,
     h('div', { class: 'people' },
       h('span', {}, 'Manager ', p.pm ? h('span', { class: 'person' }, avatar(p.pm, 'xs'), p.pm.display_name) : 'none'),
-      h('span', {}, `Members (${p.members.length}) `, avatarRow(p.members)))));
+      h('span', {}, `Members (${p.members.length}) `, avatarRow(p.members))),
+    countBar(counts)));
   frag.append(h('div', { class: 'proj-toolbar' },
     h('div', { class: 'filters', role: 'group', 'aria-label': 'Filter tasks by status' },
       [['all', 'All']].concat(TASK_STATES).map(([k, label]) => h('button', { type: 'button', class: 'filter',
         'aria-pressed': String(tf === k), onclick: () => { S.view.taskStatusFilter = k; saveView(); renderProjects(); } },
-        label + (k === 'all' ? '' : ` ${p.tasks.filter((t) => t.status === k).length}`)))),
+        label + (k === 'all' ? '' : ` ${counts[k] || 0}`)))),
     h('button', { type: 'button', class: 'primary', disabled: !p.members.length,
       title: p.members.length ? null : 'Add members before creating tasks', onclick: () => openTaskDialog(p, null) }, 'New task')));
+  const closed = (s) => (s === 'done' || s === 'cancelled' ? 1 : 0);
   const tasks = p.tasks.filter((t) => tf === 'all' || t.status === tf)
-    .sort((a, b) => (a.status === 'done') - (b.status === 'done') || b.priority - a.priority || a.id - b.id);
+    .sort((a, b) => closed(a.status) - closed(b.status) || b.priority - a.priority || a.id - b.id);
   const list = h('div', { class: 'tasks' });
   if (!tasks.length) list.append(h('p', { class: 'list-empty', text: p.tasks.length ? 'No tasks with this status.' : 'No tasks yet.' }));
   for (const t of tasks) {
-    const statusSel = h('select', { 'aria-label': `Status of ${t.title}`, onchange: (ev) => patchTask(t, { status: ev.target.value }) },
+    const statusSel = h('select', { 'aria-label': `Status of ${t.title}`, onchange: (ev) => changeTaskStatus(p, t, ev.target) },
       TASK_STATES.map(([k, label]) => h('option', { value: k, selected: t.status === k, text: label })));
-    list.append(h('div', { class: 'task' },
-      h('span', { class: 'prio p' + Math.max(0, Math.min(3, t.priority)), title: 'Priority',
-        text: stateLabel(PRIORITIES, Math.max(0, Math.min(3, t.priority))) }),
+    const prio = Math.max(0, Math.min(3, t.priority));
+    list.append(h('div', { class: 'task is-' + t.status, 'data-task-id': t.id },
+      h('span', { class: 'prio p' + prio, title: 'Priority', text: stateLabel(PRIORITIES, prio) }),
       h('span', { class: 'task-title', text: t.title }),
       h('span', { class: 'task-side' }, statusSel,
         h('button', { type: 'button', class: 'quiet', onclick: () => openTaskDialog(p, t) }, 'Edit')),
-      t.description ? h('span', { class: 'task-desc', text: t.description.slice(0, 180) }) : null,
+      t.description || (t.status === 'blocked' && t.blocked_reason) ? h('span', { class: 'task-desc' },
+        t.status === 'blocked' && t.blocked_reason ? h('span', { class: 'task-blocked', text: `Blocked: ${t.blocked_reason}` }) : null,
+        t.description ? h('span', { text: t.description.slice(0, 180) }) : null) : null,
       h('span', { class: 'task-who' }, t.assignees.map((a) => h('button', { type: 'button', title: `Chat with ${a.display_name}`,
         'aria-label': `Chat with ${a.display_name}`, onclick: () => { const ag = agentById(a.id); if (ag) openWith(ag); } },
         avatar(a, 'xs'))))));
@@ -1450,9 +2082,25 @@ function projectDetail(p) {
   return frag;
 }
 
+function changeTaskStatus(p, t, sel) {
+  if (sel.value === 'blocked') {        // a blocked task needs a reason: ask in the task dialog
+    const want = sel.value;
+    sel.value = t.status;
+    openTaskDialog(p, t, { status: want });
+    return;
+  }
+  patchTask(t, { status: sel.value });
+}
+
+function conflictMessage(e) {
+  return e.data && e.data.error === 'version_conflict'
+    ? 'Someone changed this task meanwhile. The latest version is loaded; apply your change again.' : e.message;
+}
+
 async function patchTask(t, data) {
-  try { await api('PATCH', `/api/v1/tasks/${t.id}`, data); schedule({ board: true }); }
-  catch (e) { window.alert(e.message); schedule({ board: true }); }
+  try { await api('PATCH', `/api/v1/tasks/${t.id}`, Object.assign({ expected_version: t.version }, data)); }
+  catch (e) { window.alert(conflictMessage(e)); }
+  schedule({ board: true });
 }
 
 function memberChecks(root, people, selected, locked) {
@@ -1519,7 +2167,12 @@ $('project-form').addEventListener('submit', async (ev) => {
   }
 });
 
-function openTaskDialog(p, t) {
+function syncBlockedField() {
+  const blocked = $('tf-status').value === 'blocked';
+  $('tf-blocked-wrap').hidden = !blocked;
+}
+
+function openTaskDialog(p, t, preset) {
   taskProject = p;
   editingTask = t;
   $('task-dialog-title').textContent = t ? 'Edit task' : 'New task';
@@ -1527,16 +2180,21 @@ function openTaskDialog(p, t) {
   $('tf-project').textContent = `Project: ${p.name}`;
   $('tf-title').value = t ? t.title : '';
   $('tf-desc').value = t ? (t.description || '') : '';
+  const status = (preset && preset.status) || (t ? t.status : 'open');
   const st = clear($('tf-status'));
-  TASK_STATES.forEach(([k, label]) => st.append(h('option', { value: k, selected: (t ? t.status : 'open') === k, text: label })));
+  TASK_STATES.forEach(([k, label]) => st.append(h('option', { value: k, selected: status === k, text: label })));
   const pr = clear($('tf-priority'));
   PRIORITIES.forEach(([k, label]) => pr.append(h('option', { value: k, selected: (t ? t.priority : 1) === k, text: label })));
+  $('tf-blocked').value = t && t.blocked_reason ? t.blocked_reason : '';
+  syncBlockedField();
   // Assignees come strictly from the project's members (spec 8.3).
   memberChecks($('tf-assignees'), p.members, t ? t.assignees.map((a) => a.id) : []);
   $('tf-error').textContent = '';
   $('task-dialog').showModal();
-  $('tf-title').focus();
+  if (preset && preset.status === 'blocked') $('tf-blocked').focus(); else $('tf-title').focus();
 }
+
+$('tf-status').addEventListener('change', syncBlockedField);
 
 $('task-form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
@@ -1545,29 +2203,38 @@ $('task-form').addEventListener('submit', async (ev) => {
   const body = { title: $('tf-title').value.trim(), description: $('tf-desc').value.trim() || null,
     status: $('tf-status').value, priority: Number($('tf-priority').value), assignee_ids: ids };
   if (!body.title) { $('tf-error').textContent = 'Enter a task title.'; return; }
+  if (body.status === 'blocked') body.blocked_reason = $('tf-blocked').value.trim() || null;
   try {
-    if (editingTask) await api('PATCH', `/api/v1/tasks/${editingTask.id}`, body);
-    else await api('POST', `/api/v1/projects/${taskProject.id}/tasks`, body);
+    if (editingTask) {
+      const fresh = findTask(editingTask.id) || editingTask;
+      await api('PATCH', `/api/v1/tasks/${editingTask.id}`, Object.assign({ expected_version: fresh.version }, body));
+    } else {
+      await api('POST', `/api/v1/projects/${taskProject.id}/tasks`, body);
+    }
     $('task-dialog').close();
     schedule({ board: true });
-  } catch (e) { $('tf-error').textContent = e.message; }
+  } catch (e) {
+    $('tf-error').textContent = conflictMessage(e);
+    if (e.data && e.data.error === 'version_conflict') schedule({ board: true });
+  }
 });
 
 document.querySelectorAll('dialog [data-close]').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
 
 // =============================================================================
-// Admin & Senate
+// Senate: Consul, invites, pools, server storage
 // =============================================================================
 
 function listRow(...kids) { return h('div', { class: 'list-row' }, ...kids); }
 
-function renderAdminSenate() {
+function renderSenate() {
   if (!S.board) return;
-  renderSenate();
+  renderConsul();
   renderAdmin();
+  renderStorage(S.board.server_storage);
 }
 
-function renderSenate() {
+function renderConsul() {
   const box = clear($('senate-status'));
   const consul = S.board.consul;
   box.classList.toggle('has-consul', !!consul);
@@ -1656,9 +2323,10 @@ function renderAdmin() {
       h('label', {}, 'Usage reporter', h('select', { onchange: (ev) => setReporter(p, ev.target.value) },
         h('option', { value: '', text: 'No reporter' }),
         ...members.map((a) => h('option', { value: a.id, selected: p.reporter_principal_id === a.id, text: a.display_name })))),
-      h('button', { type: 'submit', class: 'ghost' }, 'Save'));
+      h('button', { type: 'button', class: 'ghost', onclick: () => savePool(p, form) }, 'Save'));
     pr.append(h('div', { class: 'list-row' },
-      h('strong', { class: 'grow', text: poolLabel(p) }), h('span', { class: 'muted', text: `${members.length} member(s)` }), form));
+      h('strong', { class: 'grow pool-title', title: poolLabel(p) }, prov(p.provider, 18), h('span', { class: 'clip', text: poolLabel(p) })),
+      h('span', { class: 'muted', text: `${members.length} member(s)` }), form));
   }
 }
 
@@ -1722,8 +2390,69 @@ async function setReporter(p, value) {
   catch (e) { $('pool-error').textContent = e.message; }
 }
 
+// --- Lyra Server Storage ------------------------------------------------------
+
+function renderStorage(st) {
+  const box = clear($('storage'));
+  if (!st) { box.append(h('p', { class: 'muted', text: 'Storage information is not available.' })); return; }
+  const used = pct(st.used_pct);
+  const fill = h('span', { class: 'fill ' + (used >= 90 ? 'bad' : used >= 70 ? 'warn' : 'ok') });
+  fill.style.width = Math.max(used, used > 0 ? 0.6 : 0) + '%';
+  const quota = `${fmtNum(st.quota_gb, 1)} GB`;
+  box.append(h('div', { class: 'storage-head' },
+    h('span', { class: 'storage-used' }, fmtBytes(st.total_bytes), h('small', { text: ` used of ${quota}` })),
+    h('span', { class: 'muted tnum', text: `${fmtNum(st.used_pct, used < 1 ? 2 : 1)}% of quota, ${fmtBytes(st.free_bytes)} free` })),
+    h('div', { class: 'storage-bar' }, h('span', { class: 'track', role: 'img', 'aria-label': `${fmtNum(st.used_pct, 1)}% of the storage quota used` }, fill)));
+  const disk = st.host_disk || {};
+  const stat = (label, value, sub) => h('div', { class: 'stat' }, h('dt', { text: label }), h('dd', {}, value,
+    sub ? h('div', { class: 'stat-sub', text: sub }) : null));
+  box.append(h('dl', { class: 'storage-grid' },
+    stat('Database', fmtBytes(st.db_bytes), 'SQLite with WAL'),
+    stat('Attachments', fmtBytes(st.attachments_bytes), `${fmtNum(st.attachments_count)} files`),
+    stat('Orphaned uploads', `${fmtNum(st.orphan_attachments_count)}`, fmtBytes(st.orphan_attachments_bytes)),
+    stat('Backups', fmtBytes(st.backups_bytes), `${fmtNum(st.backups_count)} files`),
+    stat('Events', fmtNum(st.events_count), 'SSE replay log'),
+    stat('Messages', fmtNum(st.messages_count)),
+    stat('Host disk', disk.free_bytes != null ? `${fmtBytes(disk.free_bytes)} free` : 'unknown',
+      disk.total_bytes != null ? `of ${fmtBytes(disk.total_bytes)}` : null),
+    stat('Server uptime', st.uptime_sec != null ? uptime(st.uptime_sec) : 'unknown')));
+  box.append(h('p', { class: 'muted note', title: st.data_dir, text: `Data directory: ${st.data_dir}` }));
+}
+
+const CLEANUP_CONFIRM = {
+  prune_events: 'Delete server events older than 7 days? Live clients that are far behind will do a full reload.',
+  prune_backups: 'Delete all but the 5 newest backups?',
+  all: 'Run every cleanup step: remove orphaned uploads, prune events older than 7 days, keep the 5 newest backups and compact the WAL?',
+};
+
+document.querySelectorAll('[data-cleanup]').forEach((b) => b.addEventListener('click', async () => {
+  const action = b.dataset.cleanup;
+  if (CLEANUP_CONFIRM[action] && !window.confirm(CLEANUP_CONFIRM[action])) return;
+  $('storage-error').textContent = '';
+  const buttons = document.querySelectorAll('[data-cleanup]');
+  buttons.forEach((x) => { x.disabled = true; });
+  $('storage-result').textContent = 'Cleaning up…';
+  try {
+    const r = await api('POST', '/api/v1/admin/cleanup', { action });
+    const c = r.cleaned || {};
+    const parts = [];
+    if (action === 'all' || action === 'sweep_orphans') parts.push(`${c.orphans_removed || 0} orphaned uploads removed`);
+    if (action === 'all' || action === 'prune_events') parts.push(`${c.events_deleted || 0} old events deleted`);
+    if (action === 'all' || action === 'prune_backups') parts.push(`${c.backups_removed || 0} old backups removed`);
+    if (c.wal_checkpointed) parts.push('WAL compacted');
+    $('storage-result').textContent = `Done: ${parts.join(', ')}.`;
+    if (r.storage) { S.board.server_storage = r.storage; renderStorage(r.storage); }
+    schedule({ board: true });
+  } catch (e) {
+    $('storage-result').textContent = '';
+    $('storage-error').textContent = e.message;
+  } finally {
+    buttons.forEach((x) => { x.disabled = false; });
+  }
+}));
+
 // =============================================================================
-// Power-user ergonomics: quick switcher, conversation stepping, shortcuts
+// Power-user ergonomics: quick switcher, stepping, shortcuts
 // =============================================================================
 
 function fuzzy(query, text) {
@@ -1758,7 +2487,7 @@ function quickItems() {
     items.push({ kind: 'Project', label: p.name, sub: stateLabel(PROJECT_STATES, p.status), run: () => {
       S.view.activeProjectId = p.id; S.view.projectView = 'detail'; saveView(); setTab('projects'); renderProjects(); } });
   }
-  [['chats', 'Chats'], ['projects', 'Projects'], ['admin-senate', 'Admin & Senate'], ['agents', 'Agents']].forEach(([k, label]) =>
+  [['chats', 'Chats'], ['projects', 'Projects'], ['senate', 'Senate'], ['agents', 'Agents']].forEach(([k, label]) =>
     items.push({ kind: 'Section', label, sub: '', run: () => setTab(k) }));
   return items;
 }
@@ -1819,6 +2548,26 @@ function stepConversation(dir) {
   if (next) openConv(next.id, { user: true });
 }
 
+// n / N: next or previous agent that needs you (wraps).
+function stepNeeds(dir) {
+  const items = S.needs;
+  if (!items.length) return;
+  const current = recipientAgent();
+  const at = current ? items.findIndex((n) => n.agent.id === current.id) : -1;
+  const next = items[at === -1 ? (dir > 0 ? 0 : items.length - 1) : (at + dir + items.length) % items.length];
+  openWith(next.agent);
+}
+
+// x: next unread conversation after the current one (wraps).
+function nextUnread() {
+  const flat = orderedConvs().flat;
+  const at = S.conv && S.conv.id != null ? flat.findIndex((c) => c.id === S.conv.id) : -1;
+  for (let i = 1; i <= flat.length; i++) {
+    const c = flat[(at + i + flat.length) % flat.length];
+    if (c.unread_count) { openConv(c.id, { user: true }); return; }
+  }
+}
+
 document.addEventListener('keydown', (ev) => {
   if ($('main').hidden) return;
   const key = ev.key;
@@ -1827,6 +2576,7 @@ document.addEventListener('keydown', (ev) => {
     openQuick();
     return;
   }
+  if (key === 'Escape' && !$('host-menu').hidden) { closeHostMenu(true); return; }
   if (anyDialogOpen()) return;
   if (ev.altKey && (key === 'ArrowUp' || key === 'ArrowDown')) {
     ev.preventDefault();
@@ -1839,6 +2589,15 @@ document.addEventListener('keydown', (ev) => {
   } else if (key === '?') {
     ev.preventDefault();
     $('help-dialog').showModal();
+  } else if (key === 'n' || key === 'N') {
+    ev.preventDefault();
+    stepNeeds(key === 'N' ? -1 : 1);
+  } else if (key === 'x') {
+    ev.preventDefault();
+    nextUnread();
+  } else if (key === 'h') {
+    ev.preventDefault();
+    toggleSidebar();
   }
 });
 
@@ -1852,9 +2611,20 @@ setInterval(() => {
     const ts = Number(el.getAttribute('data-ago')) || 0;
     el.textContent = (el.getAttribute('data-prefix') || '') + ago(ts);
   });
-  refreshLifecycles();
 }, 15000);
+setInterval(() => { if (!$('main').hidden && !document.hidden) refreshLiveTimers(); }, 1000);
+
+document.querySelectorAll('.logo-slot').forEach((slot) => {
+  if (MOD.brand) slot.append(MOD.brand.logo(Number(slot.dataset.size) || 28));
+});
+if (MOD.brand) {
+  const row = $('login-providers');
+  ['anthropic', 'openai', 'google', 'moonshot'].forEach((p) => row.append(MOD.brand.provider(p, 18)));
+}
 
 loadView();
+applyTheme();
+applySidebar();
+renderNotifyToggle();
 if (MOD.pop) MOD.pop.bind(document.body);
 boot();

@@ -259,25 +259,66 @@
     assert.eq(av.getBoundingClientRect().width, 32);
   });
 
-  test('dom lifecycle: working card caps bullets; retry calls back; complete collapses', function () {
+  test('dom lifecycle: receipts with checks and actions; live bubble caps bullets', function () {
     var el = stage();
     var calls = [];
+    var base = { id: 3, conversation_id: 1, recipient: { id: 2 } };
+    var rc = L.renderReceipt(Object.assign({ state: 'waiting' }, base), {}, { onCancel: function (m) { calls.push('cancel:' + m.id); } });
+    el.appendChild(rc);
+    assert.eq(rc.getAttribute('data-kind'), 'server');
+    assert.eq(rc.querySelectorAll('.rc-checks path').length, 1);
+    rc.querySelector('.rc-btn').click();
+    L.updateReceipt(rc, Object.assign({ state: 'delivered', delivered_at: 1 }, base), {}, { onDetails: function (m) { calls.push('details:' + m.id); } });
+    assert.eq(rc.querySelector('.rc-label').textContent, 'Agent read');
+    assert.eq(rc.querySelectorAll('.rc-checks path').length, 3, 'double check');
+    rc.querySelector('.rc-btn').click();
+    L.updateReceipt(rc, Object.assign({ state: 'unconfirmed' }, base), {}, { onRetryDelivery: function (m) { calls.push('retry:' + m.id); } });
+    rc.querySelector('.rc-btn').click();
+    assert.deep(calls, ['cancel:3', 'details:3', 'retry:3']);
     var bullets = [];
-    for (var i = 0; i < 9; i++) bullets.push({ text: 'Step ' + i, status: i < 5 ? 'done' : i === 5 ? 'active' : 'pending' });
-    var msg = { id: 3, conversation_id: 1, recipient: { id: 2 }, state: 'delivered', delivered_at: 1,
-                progress: { phase: 'working', summary: 'Auditing routes', bullets: bullets } };
-    var box = L.render(msg, { now: 2 }, {});
-    el.appendChild(box);
-    assert.eq(box.getAttribute('data-phase'), 'working');
-    assert.eq(box.querySelectorAll('.work-bullet').length, 6);
-    assert.ok(box.querySelector('.work-bullet.is-active'));
-    assert.eq(box.querySelector('[aria-current="step"]').textContent, 'Working');
-    L.update(box, Object.assign({}, msg, { state: 'unconfirmed' }), {}, { onRetryDelivery: function (m) { calls.push(m.id); } });
-    box.querySelector('.lc-btn').click();
-    assert.deep(calls, [3]);
-    L.update(box, msg, { replied: true }, {});
-    assert.eq(box.querySelectorAll('.lc-rail').length, 0);
-    assert.eq(box.textContent, 'Delivered');
+    for (var i = 0; i < 9; i++) bullets.push({ text: 'Step ' + i, state: i < 5 ? 'done' : i === 5 ? 'active' : 'pending' });
+    var msg = Object.assign({ state: 'delivered', delivered_at: 1,
+                              progress: { phase: 'working', summary: 'Auditing routes', bullets: bullets } }, base);
+    var live = L.renderLive(msg, { now: 76 });
+    el.appendChild(live);
+    assert.eq(live.getAttribute('data-phase'), 'working');
+    assert.eq(live.querySelectorAll('.work-bullet').length, 6);
+    assert.ok(live.querySelector('.work-bullet.is-active'));
+    assert.eq(live.querySelector('.live-timer').textContent, '1:15');
+    assert.ok(live.querySelector('.thinking-dots'));
+    L.updateLive(live, msg, { replied: true });
+    assert.eq(live.hidden, true);
+  });
+
+  test('dom brand: gold logo and provider marks are inline SVG', function () {
+    var el = stage();
+    var logo = window.LyraBrand.logo(28);
+    el.appendChild(logo);
+    assert.eq(logo.tagName.toLowerCase(), 'svg');
+    assert.eq(logo.querySelectorAll('circle').length, 5);
+    assert.eq(logo.querySelector('circle').getAttribute('fill'), '#facc15');
+    assert.eq(logo.getAttribute('aria-hidden'), 'true');
+    var a = window.LyraBrand.provider('anthropic', 16);
+    el.appendChild(a);
+    assert.eq(a.getAttribute('aria-label'), 'Anthropic');
+    assert.ok(a.querySelector('svg path').getAttribute('d').length > 50);
+    var other = window.LyraBrand.provider('acme', 16, { title: null });
+    assert.ok(other.classList.contains('prov-other'));
+    assert.eq(other.getAttribute('aria-hidden'), 'true');
+  });
+
+  test('dom avatar: image avatars crop to the circle and fall back on error', function () {
+    var el = stage();
+    var av = A.el({ handle: 'gem', display_name: 'Gem', avatar: { image: '/static/avatars/gem.png', icon: 'gem' } }, 'md');
+    el.appendChild(av);
+    var img = av.querySelector('img.avatar-img');
+    assert.ok(img && av.classList.contains('has-image'));
+    assert.eq(getComputedStyle(img).borderRadius, '50%');
+    img.dispatchEvent(new Event('error'));
+    assert.eq(av.querySelector('img'), null, 'broken image is removed');
+    assert.ok(!av.classList.contains('has-image'));
+    assert.eq(av.querySelector('.avatar-text').textContent, '\u25c6', 'falls back to the icon');
+    assert.ok(av.style.backgroundColor !== '');
   });
 
   test('dom store: drafts persist in real localStorage across instances', function () {

@@ -52,7 +52,7 @@
 
   var thread = $('thread');
   var ask = bubble(owner, 'Please audit the **static routes** and report blockers.', true,
-    L.render({ id: 9, conversation_id: 1, recipient: dario, state: 'delivered', delivered_at: 1,
+    L.renderLive({ id: 9, conversation_id: 1, recipient: dario, state: 'delivered', delivered_at: 1,
                progress: { phase: 'working', summary: 'Auditing REST routes and CSP headers', bullets: [
                  { text: 'Inspect static file handler', status: 'done' },
                  { text: 'Draft CSP and KaTeX rules', status: 'active' },
@@ -77,19 +77,24 @@
 
   var states = $('states');
   var base = { id: 20, conversation_id: 1, recipient: dario };
+  var noop = function () {};
   [
     ['Sending', { local: 'sending' }],
-    ['Queued', Object.assign({ state: 'waiting', queue_position: 2 }, base)],
-    ['Thinking', Object.assign({ state: 'delivered', delivered_at: 1, progress: { phase: 'thinking' } }, base)],
-    ['Stale', Object.assign({ state: 'delivered', delivered_at: 1 }, base), { now: 1 + 1500 }],
-    ['Unconfirmed', Object.assign({ state: 'unconfirmed' }, base), {}, { onRetryDelivery: function () {} }],
-    ['Failed', Object.assign({ state: 'failed', state_reason: 'timeout' }, base), {}, { onRetryDelivery: function () {} }],
-    ['Not sent', { local: 'send_failed', local_error: 'offline' }, {}, { onRetrySend: function () {}, onDiscard: function () {} }],
-    ['Replied', Object.assign({ state: 'delivered' }, base), { replied: true }],
+    ['Queued', Object.assign({ state: 'waiting', queue_position: 2 }, base), {}, { onCancel: noop }],
+    ['Agent read', Object.assign({ state: 'delivered', delivered_at: 1 }, base), {}, { onDetails: noop }],
+    ['Unconfirmed', Object.assign({ state: 'unconfirmed' }, base), {}, { onRetryDelivery: noop, onDetails: noop }],
+    ['Failed', Object.assign({ state: 'failed', state_reason: 'timeout' }, base), {}, { onDetails: noop }],
+    ['Cancelled', Object.assign({ state: 'cancelled' }, base), {}, { onDetails: noop }],
+    ['Not sent', { local: 'send_failed', local_error: 'offline' }, {}, { onRetrySend: noop, onDiscard: noop }],
   ].forEach(function (row) {
     states.appendChild(el('div', 'g-label', row[0]));
-    states.appendChild(L.render(row[1], Object.assign({ now: 5 }, row[2] || {}), row[3] || {}));
+    states.appendChild(L.renderReceipt(row[1], Object.assign({ now: 5 }, row[2] || {}), row[3] || {}));
   });
+  [['Thinking', { phase: 'thinking' }], ['Needs input', { phase: 'input_required', summary: 'Which branch should I use?' }]]
+    .forEach(function (row) {
+      states.appendChild(el('div', 'g-label', row[0]));
+      states.appendChild(L.renderLive(Object.assign({ state: 'delivered', delivered_at: 1, progress: row[1] }, base), { now: 42 }));
+    });
 
   var avatars = $('avatars');
   ['dario', 'claude', 'echo', 'gem', 'kimi', 'atlas', 'nova', 'orion'].forEach(function (h, idx) {

@@ -26,7 +26,7 @@ from urllib.parse import parse_qs, urlsplit
 SERVER = Path(__file__).resolve().parents[1]
 STATIC = SERVER / 'lyra_server' / 'static'
 JS = SERVER / 'tests' / 'js'
-MODULES = ['markdown.js', 'imgpop.js', 'store.js', 'avatar.js', 'lifecycle.js']
+MODULES = ['brand.js', 'markdown.js', 'imgpop.js', 'store.js', 'avatar.js', 'lifecycle.js']
 SCANNED = MODULES + ['app.js']
 JSC = '/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc'
 CHROMES = [

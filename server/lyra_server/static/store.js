@@ -5,20 +5,23 @@
 //   s.view.load({ desktop, convIds, agentIds }) // sanitized view state
 //   s.view.save(state)
 //   s.drafts.key({ convId }) / key({ agentId }) // "lyra.ui.v2.draft.conv:4" / ".pending:7"
-//   s.drafts.save(key, { text, replyToId, mode }) // deletes the entry when it is empty
+//   s.drafts.save(key, { text, replyToId, mode, attachments }) // deletes the entry when empty
 //   s.drafts.load(key) / clear(key) / migrate(pendingKey, convKey)
 (function (root) {
   'use strict';
 
   var VIEW_KEY = 'lyra.ui.v2.state';
   var DRAFT_PREFIX = 'lyra.ui.v2.draft.';
-  var TABS = ['chats', 'projects', 'admin-senate', 'agents'];
-  var LEGACY_TABS = { board: 'chats', usage: 'chats', admin: 'admin-senate', senate: 'admin-senate' };
+  var TABS = ['chats', 'projects', 'senate', 'agents'];
+  var LEGACY_TABS = { board: 'chats', usage: 'chats', admin: 'senate', 'admin-senate': 'senate' };
   var GROUPS = ['machine', 'provider'];
+  var THEMES = ['dark', 'light'];
   var PROJECT_FILTERS = ['all', 'active', 'paused', 'completed', 'archived'];
-  var TASK_FILTERS = ['all', 'open', 'in_progress', 'in_review', 'blocked', 'done'];
+  var TASK_FILTERS = ['all', 'open', 'in_progress', 'in_review', 'blocked', 'done', 'cancelled'];
+  var SIDEBAR = { min: 280, max: 560, initial: 360 };
   var MAX_DRAFT = 20000;
   var MAX_IDS = 200;
+  var MAX_ATTACHMENTS = 8;
 
   function memoryStorage() {
     var data = new Map();
@@ -94,8 +97,15 @@
       activeTab: 'chats', selectedConvId: null, pendingAgentId: null, agentGroupMode: 'machine',
       expandedAgentIds: [], expandedMachineIds: [], expandedProviderIds: [], expandedPoolIds: [],
       activeProjectId: null, projectStatusFilter: 'all', taskStatusFilter: 'all', mobileChatView: 'list',
-      projectView: 'list',
+      projectView: 'list', theme: null, sidebarCollapsed: false, sidebarWidth: SIDEBAR.initial,
+      notify: false, mutedAgentIds: [],
     };
+  }
+
+  function clampWidth(w) {
+    var n = Math.round(Number(w));
+    if (!isFinite(n)) return SIDEBAR.initial;
+    return Math.max(SIDEBAR.min, Math.min(SIDEBAR.max, n));
   }
 
   // Restore rules from spec section 3.1. ctx lists what the current snapshot knows about;
@@ -126,6 +136,29 @@
     if (r.mobileChatView === 'thread' && (out.selectedConvId != null || out.pendingAgentId != null)) {
       out.mobileChatView = 'thread';
     }
+    if (THEMES.indexOf(r.theme) !== -1) out.theme = r.theme;      // null follows the system
+    out.sidebarCollapsed = r.sidebarCollapsed === true;
+    if (r.sidebarWidth != null) out.sidebarWidth = clampWidth(r.sidebarWidth);
+    out.notify = r.notify === true;
+    out.mutedAgentIds = idList(r.mutedAgentIds, has(c.agentIds));
+    return out;
+  }
+
+  // Uploaded images staged in the composer survive a reload; only safe metadata is kept.
+  function sanitizeAttachments(list) {
+    if (!Array.isArray(list)) return [];
+    var out = [];
+    for (var i = 0; i < list.length && out.length < MAX_ATTACHMENTS; i++) {
+      var a = list[i];
+      if (!a || !Number.isInteger(a.id) || a.id <= 0) continue;
+      if (out.some(function (x) { return x.id === a.id; })) continue;
+      out.push({
+        id: a.id,
+        filename: typeof a.filename === 'string' ? a.filename.slice(0, 200) : 'image',
+        mime_type: typeof a.mime_type === 'string' && /^image\/[a-z0-9.+-]+$/.test(a.mime_type) ? a.mime_type : null,
+        size_bytes: Number.isInteger(a.size_bytes) && a.size_bytes >= 0 ? a.size_bytes : null,
+      });
+    }
     return out;
   }
 
@@ -135,6 +168,7 @@
       text: d.text.slice(0, MAX_DRAFT),
       replyToId: Number.isInteger(d.replyToId) ? d.replyToId : null,
       mode: d.mode === 'jump' ? 'jump' : 'queue',
+      attachments: sanitizeAttachments(d.attachments),
       updatedAt: typeof d.updatedAt === 'number' ? d.updatedAt : 0,
     };
   }
@@ -171,7 +205,7 @@
       save: function (key, draft) {
         if (!key) return false;
         var d = sanitizeDraft(Object.assign({ text: '' }, draft || {}));
-        if (!d || (d.text === '' && d.replyToId == null)) { s.remove(key); return true; }
+        if (!d || (d.text === '' && d.replyToId == null && !d.attachments.length)) { s.remove(key); return true; }
         d.updatedAt = now();
         return s.set(key, d);
       },
@@ -188,8 +222,10 @@
   }
 
   root.LyraStore = {
-    version: '2.0.0',
+    version: '3.0.0',
     VIEW_KEY: VIEW_KEY,
+    SIDEBAR: Object.assign({}, SIDEBAR),
+    clampWidth: clampWidth,
     DRAFT_PREFIX: DRAFT_PREFIX,
     create: create,
     memoryStorage: memoryStorage,

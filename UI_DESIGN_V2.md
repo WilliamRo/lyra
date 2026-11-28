@@ -12,7 +12,7 @@ Constraints kept on this branch:
 
 - **Spec:** the v2 contract for layout, state, chat features, agent grouping, Admin & Senate, Projects and QA-01 to QA-28.
 - **Design guidance:** the workspace `frontend-design` skill (two-pass plan and self-critique, avoid templated defaults) and Vercel's `web-design-guidelines` checklist (accessibility, focus, forms, motion, typography, content handling).
-- **Survey of agent-orchestration UIs** (2026-11-28; sources in section 12): Vibe Kanban, Paperclip, Mission Control (builderz-labs), Linear (agent sessions and the March 2026 UI refresh) and the OpenAI Codex app (now documented as part of the ChatGPT desktop app).
+- **Survey of agent-orchestration UIs** (2026-11-28; sources in section 13): Vibe Kanban, Paperclip, Mission Control (builderz-labs), Linear (agent sessions and the March 2026 UI refresh) and the OpenAI Codex app (now documented as part of the ChatGPT desktop app).
 - **Rendering checks:** headless Chrome screenshots of the implemented modules at 1280 px, in dark mode, and at a true 390 x 844 viewport.
 
 ## 2. Design Direction
@@ -288,7 +288,7 @@ Destructive actions (revoke, dismiss Consul, cancel invite) always confirm; surv
 | Session expiry | A 401 keeps drafts and view state, shows the sign-in card, and restores the same conversation afterwards | Spec 3.2 |
 | Shortcut help | `?` opens a small list of the shortcuts above | Linear |
 
-Nothing else is bound by default; single-letter shortcuts are avoided so typing in a thread can never trigger an action.
+Stage 3 adds three single-letter keys (section 12): `N` / `Shift+N` (next or previous agent that needs you), `X` (next unread conversation) and `H` (hide or show the agents sidebar). They act only when focus is outside every text field, select and dialog, so typing in a thread can never trigger them.
 
 ## 9. Implemented Modules on This Branch
 
@@ -345,15 +345,56 @@ The modules still degrade safely: without KaTeX, math shows as TeX source; witho
 - `server/tests/test_js_modules.py` runs with the normal server suite:
   - **Hygiene scan:** no `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function` or style or event attributes in the modules, plus a check that the vendored KaTeX is present.
   - **Hygiene scan** also covers `app.js`, and a static check pins the live `web.CSP` to `'unsafe-inline'` for style attributes only.
-  - **Engine tests** (`tests/js/test_engine.js`, 27 cases): parser, geometry, storage, avatar (including server formats) and lifecycle (including server `state` bullets and the `stale` flag). Runs under JavaScriptCore (`jsc` on macOS) or Node (CI).
+  - **Engine tests** (`tests/js/test_engine.js`, 32 cases): parser, geometry, storage (theme, sidebar, mutes, draft images), brand, avatar (server formats and image paths) and lifecycle (receipts, the live bubble, server `state` bullets and the `stale` flag). Runs under JavaScriptCore (`jsc` on macOS) or Node (CI).
   - **Browser tests** (`tests/js/test_dom.js`, 13 cases, plus the engine cases in the page): set `LYRA_BROWSER_TESTS=1` with Chrome or Chromium installed. Pages are served with the live Lyra CSP header; `tests/js/csp_probe.html` checks KaTeX against each blocked vector. Covers XSS payloads (QA-02), KaTeX and currency (QA-20), wide tables on 390 px (QA-18), the dialog size, wheel anchoring, drag clamping, double-click, keyboard, pinch and double-tap (QA-06, QA-07), focus return, avatars (QA-12), lifecycle (QA-21, QA-22) and persistent drafts (QA-11).
-- `server/tests/test_board_e2e.py` (opt-in with `LYRA_BROWSER_TESTS=1`) runs the wired board end to end. It seeds a real server through the public API (`tests/js/qa_board.py`: hosts with telemetry, pools with usage, Consul, every message lifecycle state, an image, pins, a team thread, projects with all five task states) and puts a test-only sign-in proxy in front, which can drop SSE streams. It then drives Chrome over the DevTools pipe (`tests/js/cdp.py`) at 1440 x 900 and at 390 x 844 (touch, DPR 2):
-  - `tests/js/qa/probe.js` steps through about 25 feature checks with DOM events only.
+- `server/tests/test_board_e2e.py` (opt-in with `LYRA_BROWSER_TESTS=1`) runs the wired board end to end. It seeds a real server through the public API (`tests/js/qa_board.py`: hosts with telemetry and an alias, pools with usage and a long duplicated label, Consul, PNG avatars, needs-input, stalled, held and offline agents, every message state including cancelled, an image, pins, a team thread, an orphaned upload, projects with all six task states and a blocked reason) and puts a test-only sign-in proxy in front, which can drop SSE streams. It then drives Chrome over the DevTools pipe (`tests/js/cdp.py`) at 1440 x 900 and at 390 x 844 (touch, DPR 2):
+  - `tests/js/qa/probe.js` runs 32 desktop and 6 phone feature checks with DOM events only, in light and in dark. It also fails on any element that crosses its rail, card or row container.
   - Any page error, console error or CSP violation fails the test.
   - `tests/js/qa_shots.py` captures light and dark screenshots; set `LYRA_QA_SHOTS=<dir>` to keep them.
 - `tests/js/gallery.html` and `tests/js/phone.html` remain the module-level visual QA pages; they are not served by Lyra.
 
-## 12. Survey Notes and References
+## 12. Stage 3 (schema v5): UI and orchestration
+
+Wired against `upstream/main` dcebc90 (`docs/API.md` section 6.4); `server/lyra_server/*.py` is unchanged on this branch.
+
+### 12.1 Look and brand
+
+- **Themes:** one token set through `light-dark()`. The default follows the system; the topbar switch (`#themeToggle`, `role="switch"`) pins Dark or Light in LyraStore (`theme`), and `brand.js` applies it in `<head>` before first paint. Dark uses neutral grays: `#121316` page, `#18191c` bars, `#202124` cards, `#282a2e` raised surfaces, `#2f3136` lines, `#e8eaed` text.
+- **Brand:** `brand.js` draws the Lyra constellation (Vega as a four-point star, then the zeta, delta, gamma and beta parallelogram) in `#facc15` on a dark tile, inline SVG with no external URLs. The wordmark is `#facc15` in dark and `#b07d00` in light (3.6:1 on white). `static/favicon.svg` is a bolder variant that stays legible at 16 px.
+- **Provider marks:** Anthropic, Google, Google Gemini and Moonshot AI come from Simple Icons (CC0-1.0), and OpenAI from LobeHub lobe-icons (MIT). They are inlined as single SVG paths. Anthropic and Google keep their brand colors; OpenAI and Moonshot use `currentColor`. They appear in By provider headers, pool cards, Senate pools, agent rows and drawers, and on the sign-in card. Unknown providers get a neutral hexagon.
+- **Avatars:** `avatar.image` (`/static/avatars/<file>`, same path rule as the server) renders as a circle-cropped `<img>`; on `error` the image is removed and the icon or initials return.
+- **Controls:** thin scrollbars in both themes. Attach image is a paperclip icon (36 px, 44 px on touch) with a CSS tooltip that also shows when it is disabled ("Text only: this agent does not accept images"). Delivery and Send are pills.
+
+### 12.2 Agents rail
+
+- **Needs you (n):** the first section of the rail lists agents that need the owner, one entry per agent, with the most urgent reason first. Reasons are `needs_input`, `stalled`, offline with waiting or unconfirmed mail, unconfirmed delivery, and a failed message in the last 24 hours. The count shows on the mobile Agents tab and in `document.title` together with unread messages.
+- **Status chips:** each row shows the server's `effective_status` honestly (`needs input`, `stalled`, `no updates` for stale, `detached`, `working`, `unknown`, `idle`, `offline`). `effective_since` goes in the tooltip and the drawer. A purple `held` pill marks a held agent.
+- **Context ring:** 14 px, colored by band: under 30% calm, 30 to 60% normal, 60 to 80% warning, 80% and up critical.
+- **Drawer actions:** Hold or Resume delivery (`POST` or `DELETE /admin/principals/{id}/hold`), and Mute notifications per agent (`mutedAgentIds`).
+- **Machines:** host cards show the alias (`hosts[].display_name`) on one line with an ellipsis; host names never break mid-word. RAM and disk bars fill and carry explicit `used / total GB` labels (`22.5 / 64 GB`, `492 / 1858 GB`). Right-click (or the Menu key) opens a menu with Rename machine (a dialog, no `prompt()`), Use the host name, and Show details; the expanded card repeats Rename for touch users. Changes go to `PUT /admin/hosts/{host}`.
+- **Pools:** label, account and plan are shown once each. Every rail, card and row child has `min-width: 0`, and long labels and pills end in an ellipsis, so no text crosses the rail divider (owner screenshot #131).
+- **Sidebar:** collapse with the topbar button or `H`. Drag the gutter handle to resize, or use arrow keys on it (Shift for larger steps, Home and End for the limits); double-click resets. Width is clamped to 280 to 560 px. Collapsed state and width persist. The phone layout keeps its Agents tab.
+
+### 12.3 Threads
+
+- **Owner receipts:** `Sending…`, then one check `Server` (with `#n in queue` and `Cancel` while unclaimed), then two checks `Agent read`. `Delivery unconfirmed` offers `Retry`; `Cancelled` and `Failed: reason` are shown plainly. No progress appears under the owner's bubble.
+- **Live agent bubble:** while the agent is thinking, working or waiting for input, a dashed placeholder bubble with its avatar sits at the bottom of the thread. It shows animated dots, the summary, the step bullets (six visible) and an elapsed `m:ss` timer. Input required is outlined in the accent color, and stale or stalled work turns amber or red. It disappears when the reply lands.
+- **Details:** a quiet trigger on answered, delivered, unconfirmed, failed or cancelled messages opens a dialog backed by `GET /messages/{id}/lifecycle`. It lists the milestones (browser, server, claim, agent read, progress, reply) with millisecond times, bars for `client_to_server`, `server_to_claim`, `claim_to_agent_read`, `agent_think_to_reply` and `total_round_trip`, and a delivery attempts table. Sends include `client_sent_at`.
+- **Cancel:** `POST /messages/{id}/cancel`; a `409 message_claimed` says it is too late.
+- **Draft images:** uploaded images are part of the per-conversation draft (`{id, filename, mime_type, size_bytes}`, at most eight). They return as thumbnails after a reload. A thumbnail that fails to load (an expired upload) is pruned from the draft with a short note. Images stay in the draft while an agent is temporarily text only; Send is disabled until they are removed or allowed.
+
+### 12.4 Projects, Senate and storage
+
+- **Tasks:** the `cancelled` state appears in filters, selects and the project count bar (`task_counts`). Choosing `Blocked` opens the task dialog with a reason field (`blocked_reason`). Every update sends `expected_version`; a `409 version_conflict` reloads the board and asks the owner to apply the change again.
+- **Senate:** the tab formerly called "Admin & Senate" is now **Senate**. Stored `admin-senate` and `admin` tabs map to it.
+- **Lyra Server Storage:** reads `board.server_storage`, with the cleanup response refreshing it. It shows usage against the quota (10 GB by default) and a breakdown: database, attachments, orphaned uploads, backups, events, messages, host disk free of total, and server uptime. Buttons run `POST /admin/cleanup` with `sweep_orphans`, `prune_events`, `prune_backups`, `vacuum_wal` or `all`; destructive steps ask for confirmation.
+
+### 12.5 Live data and alerts
+
+- **SSE:** the cursor is seeded from `board.last_event_id`. `event: reset` triggers a full reload. The named `event: tick` (every 15 s) feeds a 30 s watchdog that drops a silent stream into the reconnect banner. `host` events refresh the board.
+- **Notifications:** an explicit bell toggle requests permission on the user's gesture. While the tab is hidden, a new agent message or a new Needs you reason raises a desktop notification with a soft two-tone WebAudio chime, unless that agent is muted.
+
+## 13. Survey Notes and References
 
 | Product | Adopted | Avoided |
 | --- | --- | --- |

@@ -1188,19 +1188,22 @@ class SseAndBackupTests(ServerCase):
 
 class SenateAndConsulTests(ServerCase):
 
-  def test_admin_and_senate_share_one_tab(self):
-    # UI v2 merges Admin and Senate into one "Admin & Senate" tab (UI_DESIGN_V2.md section 9).
+  def test_senate_tab_holds_consul_admin_and_storage(self):
+    # UI Stage 3: one "Senate" tab holds the Consul office, invites, pools and server storage.
     with urllib.request.urlopen(f'{self.base}/') as resp:
       html = resp.read().decode('utf-8')
-    self.assertIn('data-tab="admin-senate"', html)
-    for old in ('data-tab="admin"', 'data-tab="senate"', 'data-tab="usage"'):
+    self.assertIn('data-tab="senate"', html)
+    self.assertIn('>Senate</button>', html)
+    for old in ('data-tab="admin"', 'data-tab="admin-senate"', 'data-tab="usage"', 'Admin &amp; Senate'):
       self.assertNotIn(old, html)
-    pane = html.find('data-pane="admin-senate"')
+    pane = html.find('data-pane="senate"')
     senate = html.find('id="senate-form"')
     invites = html.find('id="invite-form"')
+    storage = html.find('id="storage"')
     self.assertGreater(pane, 0)
     self.assertGreater(senate, pane)
     self.assertGreater(invites, pane)
+    self.assertGreater(storage, pane)
     self.assertIn('Appoint Consul', html)
     self.assertIn('Dismiss Consul', html)
 

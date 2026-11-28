@@ -1,27 +1,28 @@
-// Lyra lifecycle.js: delivery and progress tracker under the owner's sent messages.
-// UI_SPEC_AND_QA section 5, plus a "no response yet" stale hint after a quiet period.
+// Lyra lifecycle.js v3: compact delivery receipts under the owner's messages, and the live
+// agent-side bubble (thinking, working, input required) shown at the bottom of a thread.
 //
-//   LyraLifecycle.phase(msg, ctx)            -> { phase, step, label, stale, queue }
-//   LyraLifecycle.replied(msg, msgs)         -> true once the recipient has answered
-//   LyraLifecycle.render(msg, ctx, handlers) -> <div class="msg-lifecycle"> (DOM)
-//   LyraLifecycle.update(el, msg, ctx, handlers) re-renders in place (node identity kept)
-// msg.local may be 'sending' or 'send_failed' for optimistic entries without a server id.
-// handlers: { onRetryDelivery(msg), onRetrySend(msg), onDiscard(msg) }
+//   LyraLifecycle.receipt(msg, ctx)                 -> { kind, checks, label, tone, actions[] }
+//   LyraLifecycle.renderReceipt(msg, ctx, handlers) -> <div class="receipt"> (DOM)
+//   LyraLifecycle.updateReceipt(el, msg, ctx, handlers) re-renders in place
+//   LyraLifecycle.live(msg, ctx)                    -> null, or { phase, label, stale, bullets, since }
+//   LyraLifecycle.renderLive(msg, ctx) / updateLive(el, msg, ctx)
+//   LyraLifecycle.replied(msg, msgs), cleanProgress(p), clock(seconds)
+// ctx: { now, replied, agentStatus, document }. msg.local is 'sending' or 'send_failed' for
+// optimistic entries. handlers: { onCancel, onRetryDelivery, onRetrySend, onDiscard, onDetails }.
 (function (root) {
   'use strict';
 
-  var STEPS = ['Sent', 'Queued', 'Delivered', 'Working', 'Replied'];
-  var PHASES = ['thinking', 'working', 'idle'];
+  var PHASES = ['thinking', 'working', 'input_required'];
   var BULLET_STATES = ['done', 'active', 'pending'];
   var MAX_VISIBLE = 6;
-  var STALE_AFTER = 900;            // seconds without progress or reply after delivery
+  var SVG_NS = 'http://www.w3.org/2000/svg';
 
   function cleanProgress(p) {
     if (!p || typeof p !== 'object' || PHASES.indexOf(p.phase) === -1) return null;
     var bullets = Array.isArray(p.bullets) ? p.bullets.slice(0, 50) : [];
     return {
       phase: p.phase,
-      summary: typeof p.summary === 'string' ? p.summary.slice(0, 200) : '',
+      summary: typeof p.summary === 'string' ? p.summary.slice(0, 240) : '',
       bullets: bullets.filter(function (b) { return b && typeof b.text === 'string' && b.text.trim(); })
         .map(function (b) {
           var st = b.status || b.state;                    // the server sends `state`
@@ -50,49 +51,44 @@
     return m < 60 ? m + ' min' : Math.round(m / 60) + ' h';
   }
 
-  function phase(msg, ctx) {
-    var c = ctx || {};
+  // 0:42, 3:05, 1:02:10
+  function clock(sec) {
+    var s = Math.max(0, Math.floor(sec || 0));
+    var h = Math.floor(s / 3600);
+    var m = Math.floor((s % 3600) / 60);
+    var r = s % 60;
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    return h ? h + ':' + pad(m) + ':' + pad(r) : m + ':' + pad(r);
+  }
+
+  // --- owner receipts ---------------------------------------------------------
+
+  function receipt(msg, ctx) {
     var m = msg || {};
-    var prog = cleanProgress(m.progress);
-    var out = { phase: 'waiting', step: 1, label: '', stale: false, queue: null, progress: prog };
-    if (m.local === 'sending') return Object.assign(out, { phase: 'sending', step: 0, label: 'Sending…' });
+    var c = ctx || {};
+    if (m.local === 'sending') return { kind: 'sending', checks: 0, label: 'Sending…', tone: 'muted', actions: [] };
     if (m.local === 'send_failed') {
-      return Object.assign(out, { phase: 'send_failed', step: 0, label: 'Not sent: ' + (m.local_error || 'network error') });
+      return { kind: 'send_failed', checks: 0, label: 'Not sent: ' + (m.local_error || 'network error'), tone: 'bad',
+               actions: ['retrySend', 'discard'] };
     }
-    if (m.state === 'failed') {
-      return Object.assign(out, { phase: 'failed', step: 1, label: 'Failed: ' + (m.state_reason || 'delivery failed') });
-    }
-    if (m.state === 'unconfirmed') {
-      return Object.assign(out, { phase: 'unconfirmed', step: 2, label: 'Delivery unconfirmed' });
-    }
-    if (c.replied) return Object.assign(out, { phase: 'complete', step: 4, label: 'Delivered' });
-    if (m.state === 'waiting') {
-      var q = typeof m.queue_position === 'number' ? m.queue_position : null;
-      return Object.assign(out, { phase: 'waiting', step: 1, queue: q,
-                                  label: 'Waiting in queue' + (q && q > 1 ? ' (#' + q + ')' : '') });
-    }
-    if (m.state === 'delivered') {
-      var now = typeof c.now === 'number' ? c.now : Date.now() / 1000;
-      if (prog && (prog.phase === 'working' || prog.phase === 'thinking')) {
-        var working = prog.phase === 'working';
-        if (prog.stale) {
-          // Server flag: no progress update for longer than progress_stale_sec.
-          var quiet = typeof prog.updated_at === 'number' ? ' for ' + minutes(now - prog.updated_at) : '';
-          return Object.assign(out, { phase: prog.phase, step: 3, stale: true,
-                                      label: 'No update' + quiet + (prog.summary ? ': ' + prog.summary : '') });
-        }
-        return Object.assign(out, { phase: prog.phase, step: 3,
-                                    label: prog.summary || (working ? 'Working…' : 'Thinking…') });
+    switch (m.state) {
+      case 'waiting': {
+        var q = typeof m.queue_position === 'number' && m.queue_position > 1 ? m.queue_position : null;
+        return { kind: 'server', checks: 1, label: 'Server' + (q ? ', #' + q + ' in queue' : ''), tone: 'muted',
+                 actions: ['cancel'] };
       }
-      var since = (prog && prog.updated_at) || m.delivered_at;
-      var limit = typeof c.staleAfterSec === 'number' ? c.staleAfterSec : STALE_AFTER;
-      if (typeof since === 'number' && now - since >= limit) {
-        return Object.assign(out, { phase: 'delivered', step: 2, stale: true,
-                                    label: 'Delivered, no reply for ' + minutes(now - since) });
-      }
-      return Object.assign(out, { phase: 'delivered', step: 2, label: 'Delivered, awaiting agent…' });
+      case 'unconfirmed':
+        return { kind: 'unconfirmed', checks: 1, label: 'Delivery unconfirmed', tone: 'warn', actions: ['retry', 'details'] };
+      case 'failed':
+        return { kind: 'failed', checks: 0, label: 'Failed: ' + (m.state_reason || 'delivery failed'), tone: 'bad',
+                 actions: ['details'] };
+      case 'cancelled':
+        return { kind: 'cancelled', checks: 0, label: 'Cancelled', tone: 'muted', actions: ['details'] };
+      case 'delivered':
+        return { kind: c.replied ? 'replied' : 'read', checks: 2, label: 'Agent read', tone: 'ok', actions: ['details'] };
+      default:
+        return { kind: 'server', checks: 1, label: 'Server', tone: 'muted', actions: [] };
     }
-    return Object.assign(out, { label: 'Waiting in queue' });
   }
 
   function node(doc, tag, cls, text) {
@@ -102,11 +98,92 @@
     return n;
   }
 
+  function checks(doc, count) {
+    var svg = doc.createElementNS(SVG_NS, 'svg');
+    svg.setAttribute('class', 'rc-checks');
+    svg.setAttribute('viewBox', count === 2 ? '0 0 22 14' : '0 0 16 14');
+    svg.setAttribute('width', count === 2 ? '18' : '13');
+    svg.setAttribute('height', '12');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    var paths = count === 2 ? ['M1.5 7.5l3.5 3.5 7.5-8', 'M9 11l7.5-8', 'M7.6 9.6l1.4 1.4'] : ['M2 7.5l3.5 3.5 8-8.5'];
+    paths.forEach(function (d) {
+      var p = doc.createElementNS(SVG_NS, 'path');
+      p.setAttribute('d', d);
+      p.setAttribute('fill', 'none');
+      p.setAttribute('stroke', 'currentColor');
+      p.setAttribute('stroke-width', '1.8');
+      p.setAttribute('stroke-linecap', 'round');
+      p.setAttribute('stroke-linejoin', 'round');
+      svg.appendChild(p);
+    });
+    return svg;
+  }
+
   function button(doc, cls, text, fn, msg) {
     var b = node(doc, 'button', cls, text);
     b.type = 'button';
-    b.addEventListener('click', function (ev) { ev.stopPropagation(); fn(msg); });
+    b.addEventListener('click', function (ev) { ev.stopPropagation(); fn(msg, b); });
     return b;
+  }
+
+  var ACTIONS = {
+    cancel: ['onCancel', 'Cancel', 'rc-btn'],
+    retry: ['onRetryDelivery', 'Retry', 'rc-btn'],
+    retrySend: ['onRetrySend', 'Retry', 'rc-btn'],
+    discard: ['onDiscard', 'Discard', 'rc-btn rc-quiet'],
+    details: ['onDetails', 'Details', 'rc-btn rc-quiet'],
+  };
+
+  function updateReceipt(el, msg, ctx, handlers) {
+    var doc = el.ownerDocument;
+    var h = handlers || {};
+    var info = receipt(msg, ctx);
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.className = 'receipt is-' + info.kind + ' tone-' + info.tone;
+    el.setAttribute('data-kind', info.kind);
+    var status = node(doc, 'span', 'rc-status');
+    status.setAttribute('role', 'status');
+    if (info.kind === 'sending') status.appendChild(node(doc, 'span', 'rc-spinner'));
+    else if (info.checks) status.appendChild(checks(doc, info.checks));
+    status.appendChild(node(doc, 'span', 'rc-label', info.label));
+    el.appendChild(status);
+    info.actions.forEach(function (a) {
+      var spec = ACTIONS[a];
+      if (spec && h[spec[0]]) el.appendChild(button(doc, spec[2], spec[1], h[spec[0]], msg));
+    });
+    return info;
+  }
+
+  function renderReceipt(msg, ctx, handlers) {
+    var doc = (ctx && ctx.document) || root.document;
+    var el = doc.createElement('div');
+    updateReceipt(el, msg, ctx, handlers);
+    return el;
+  }
+
+  // --- live agent-side bubble ---------------------------------------------------
+
+  function live(msg, ctx) {
+    var m = msg || {};
+    var c = ctx || {};
+    if (m.local || m.state !== 'delivered' || c.replied) return null;
+    var prog = cleanProgress(m.progress);
+    if (!prog) return null;
+    var now = typeof c.now === 'number' ? c.now : Date.now() / 1000;
+    var since = typeof m.delivered_at === 'number' ? m.delivered_at : (prog.updated_at || now);
+    var stalled = c.agentStatus === 'stalled';
+    var stale = prog.stale || stalled || c.agentStatus === 'stale';
+    var label;
+    if (prog.phase === 'input_required') label = 'Needs your input' + (prog.summary ? ': ' + prog.summary : '');
+    else if (prog.phase === 'working') label = prog.summary || 'Working';
+    else label = prog.summary || 'Thinking';
+    if (stale && prog.phase !== 'input_required') {
+      var quiet = prog.updated_at != null ? ' for ' + minutes(now - prog.updated_at) : '';
+      label = (stalled ? 'Stalled, no activity' : 'No update') + quiet + ': ' + label;
+    }
+    return { phase: prog.phase, label: label, stale: stale, stalled: stalled, bullets: prog.bullets,
+             since: since, elapsed: Math.max(0, now - since) };
   }
 
   function visibleWindow(bullets) {
@@ -118,93 +195,67 @@
     return { start: start, end: start + MAX_VISIBLE };
   }
 
-  function fill(container, msg, ctx, handlers) {
-    var doc = container.ownerDocument;
-    var h = handlers || {};
-    var info = phase(msg, ctx);
-    while (container.firstChild) container.removeChild(container.firstChild);
-    container.className = 'msg-lifecycle is-' + info.phase + (info.stale ? ' is-stale' : '');
-    container.setAttribute('data-phase', info.phase);
-
-    if (info.phase === 'complete') {
-      container.appendChild(node(doc, 'span', 'lc-pill is-done', info.label));
-      return info;
-    }
-
-    var rail = node(doc, 'ol', 'lc-rail');
-    rail.setAttribute('aria-label', 'Delivery progress');
-    var failedStep = info.phase === 'failed' || info.phase === 'send_failed' ? info.step : -1;
-    STEPS.forEach(function (name, i) {
-      var li = node(doc, 'li', 'lc-step');
-      if (i < info.step) li.classList.add('is-done');
-      if (i === info.step) li.classList.add(failedStep === i ? 'is-error' : 'is-current');
-      li.appendChild(node(doc, 'span', 'lc-dot'));
-      li.appendChild(node(doc, 'span', 'lc-step-name', name));
-      if (i === info.step) li.setAttribute('aria-current', 'step');
-      rail.appendChild(li);
-    });
-    container.appendChild(rail);
-
-    var status = node(doc, 'div', 'lc-status');
-    status.setAttribute('role', 'status');
-    status.setAttribute('aria-live', 'polite');
-    if ((info.phase === 'thinking' && !info.stale) || info.phase === 'sending') {
+  function updateLive(el, msg, ctx) {
+    var doc = el.ownerDocument;
+    var info = live(msg, ctx);
+    while (el.firstChild) el.removeChild(el.firstChild);
+    if (!info) { el.hidden = true; return null; }
+    el.hidden = false;
+    el.className = 'live-status is-' + info.phase + (info.stale ? ' is-stale' : '') + (info.stalled ? ' is-stalled' : '');
+    el.setAttribute('data-phase', info.phase);
+    var head = node(doc, 'div', 'live-head');
+    if (!info.stale && info.phase !== 'input_required') {
       var dots = node(doc, 'span', 'thinking-dots');
       dots.setAttribute('aria-hidden', 'true');
       for (var d = 0; d < 3; d++) dots.appendChild(doc.createElement('span'));
-      status.appendChild(dots);
+      head.appendChild(dots);
     }
-    status.appendChild(node(doc, 'span', 'lc-label', info.label));
-    container.appendChild(status);
-
-    if (info.phase === 'working' && info.progress && info.progress.bullets.length) {
+    var label = node(doc, 'span', 'live-label', info.label);
+    label.setAttribute('role', 'status');
+    head.appendChild(label);
+    var timer = node(doc, 'span', 'live-timer', clock(info.elapsed));
+    timer.setAttribute('data-since', String(info.since));
+    timer.setAttribute('title', 'Time since the agent picked this up');
+    head.appendChild(timer);
+    el.appendChild(head);
+    if (info.bullets.length && info.phase !== 'thinking') {
       var card = node(doc, 'div', 'work-card');
-      var bullets = info.progress.bullets;
-      var win = visibleWindow(bullets);
+      var win = visibleWindow(info.bullets);
       if (win.start > 0) card.appendChild(node(doc, 'div', 'work-more', win.start + ' earlier steps done'));
       var ul = node(doc, 'ul', 'work-bullets');
-      bullets.slice(win.start, win.end).forEach(function (b) {
+      info.bullets.slice(win.start, win.end).forEach(function (b) {
         var li = node(doc, 'li', 'work-bullet is-' + b.status);
         var mark = node(doc, 'span', 'work-mark');
         mark.setAttribute('aria-hidden', 'true');
         li.appendChild(mark);
         li.appendChild(node(doc, 'span', 'work-text', b.text));
-        var sr = node(doc, 'span', 'lc-sr', b.status === 'done' ? ' (done)' : b.status === 'active' ? ' (in progress)' : ' (pending)');
-        li.appendChild(sr);
+        li.appendChild(node(doc, 'span', 'lc-sr', b.status === 'done' ? ' (done)' : b.status === 'active' ? ' (in progress)' : ' (pending)'));
         ul.appendChild(li);
       });
       card.appendChild(ul);
-      if (win.end < bullets.length) card.appendChild(node(doc, 'div', 'work-more', '+' + (bullets.length - win.end) + ' more'));
-      container.appendChild(card);
+      if (win.end < info.bullets.length) card.appendChild(node(doc, 'div', 'work-more', '+' + (info.bullets.length - win.end) + ' more'));
+      el.appendChild(card);
     }
-
-    var actions = null;
-    if ((info.phase === 'unconfirmed' || info.phase === 'failed') && h.onRetryDelivery) {
-      actions = node(doc, 'div', 'lc-actions');
-      actions.appendChild(button(doc, 'lc-btn', 'Retry delivery', h.onRetryDelivery, msg));
-    } else if (info.phase === 'send_failed') {
-      actions = node(doc, 'div', 'lc-actions');
-      if (h.onRetrySend) actions.appendChild(button(doc, 'lc-btn', 'Retry send', h.onRetrySend, msg));
-      if (h.onDiscard) actions.appendChild(button(doc, 'lc-btn lc-btn-quiet', 'Discard', h.onDiscard, msg));
-    }
-    if (actions && actions.firstChild) container.appendChild(actions);
     return info;
   }
 
-  function render(msg, ctx, handlers) {
+  function renderLive(msg, ctx) {
     var doc = (ctx && ctx.document) || root.document;
     var el = doc.createElement('div');
-    fill(el, msg, ctx, handlers);
+    updateLive(el, msg, ctx);
     return el;
   }
 
   root.LyraLifecycle = {
-    version: '2.0.0',
-    STEPS: STEPS.slice(),
-    phase: phase,
+    version: '3.0.0',
+    receipt: receipt,
+    renderReceipt: renderReceipt,
+    updateReceipt: updateReceipt,
+    live: live,
+    renderLive: renderLive,
+    updateLive: updateLive,
     replied: replied,
     cleanProgress: cleanProgress,
-    render: render,
-    update: fill,
+    clock: clock,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -125,6 +125,9 @@ class Chrome:
     self.send('Emulation.setFocusEmulationEnabled', {'enabled': True})
     return self
 
+  def grant(self, origin, permissions):
+    self.send('Browser.grantPermissions', {'origin': origin, 'permissions': permissions}, session=False)
+
   def navigate(self, url, timeout=20):
     self.events = [e for e in self.events if e.get('method') != 'Page.loadEventFired']
     self.send('Page.navigate', {'url': url})
