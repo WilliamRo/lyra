@@ -11,7 +11,7 @@ import sqlite3
 import threading
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _schema_sql():
@@ -40,7 +40,11 @@ class Database:
       os.chmod(self.path, 0o600)
     except OSError:
       pass
-    self._migrate()
+    try:
+      self._migrate()
+    except BaseException:
+      self.conn.close()
+      raise
 
   # --- schema --------------------------------------------------------------
 
@@ -56,7 +60,7 @@ class Database:
       v = self._version()
       if v == 0:
         self.conn.executescript('BEGIN;' + _schema_sql() +
-                                "INSERT INTO meta VALUES ('schema_version', '3'); COMMIT;")
+                                f"INSERT INTO meta VALUES ('schema_version', '{SCHEMA_VERSION}'); COMMIT;")
         return
       if v == 1:
         self.conn.executescript(
@@ -69,10 +73,19 @@ class Database:
           "UPDATE meta SET value='2' WHERE key='schema_version'; COMMIT;"
         )
         v = 2
-      if v == 2:
+      if v in (2, 3):
+        # Apply all remaining DDL atomically, including the v3 tables for a v2 input.
+        add_capabilities = 'ALTER TABLE presence ADD COLUMN capabilities TEXT;' if v == 2 else ''
         self.conn.executescript(
-          'BEGIN; ALTER TABLE presence ADD COLUMN capabilities TEXT;' + _schema_sql() +
-          "UPDATE meta SET value='3' WHERE key='schema_version'; COMMIT;"
+          'BEGIN;' + add_capabilities +
+          'ALTER TABLE principals ADD COLUMN avatar TEXT;'
+          'ALTER TABLE pools ADD COLUMN account_label TEXT;'
+          'ALTER TABLE pools ADD COLUMN subscription TEXT;'
+          'ALTER TABLE pools ADD COLUMN notes TEXT;'
+          'ALTER TABLE presence ADD COLUMN host_metrics TEXT;'
+          'ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;'
+          'ALTER TABLE conversations ADD COLUMN pinned_at REAL;' + _schema_sql() +
+          "UPDATE meta SET value='4' WHERE key='schema_version'; COMMIT;"
         )
       elif v > SCHEMA_VERSION:
         raise RuntimeError(f'database schema {v} is newer than this server ({SCHEMA_VERSION})')

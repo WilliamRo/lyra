@@ -13,6 +13,7 @@ import time
 
 from . import activity, procwatch, status, store
 from .client import Client, LyraError
+from .telemetry import host_metrics
 
 
 ATTACHED_FRESH_SEC = 25.0
@@ -46,7 +47,7 @@ def checkin_payload(handle, cfg, pid):
   return {
     'instance_id': f'{socket.gethostname()}:{pid}', 'host': socket.gethostname(),
     'provider': cfg.get('provider', 'anthropic'), 'runtime': cfg.get('runtime', 'claude-code'),
-    'capabilities': {'images': bool(cfg.get('supports_images', True))},
+    'capabilities': {'images': bool(cfg.get('supports_images', True))}, 'host_metrics': host_metrics(),
     'connector': 'lyra-link', 'modes': modes, 'status': st, 'usage': usage,
   }
 

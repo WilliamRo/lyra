@@ -132,6 +132,10 @@ class Client:
                         {'body': body, 'mode': mode, 'client_msg_id': client_msg_id,
                          'attachment_ids': attachment_ids or []})
 
+  def progress(self, message_id, phase, summary=None, bullets=None):
+    return self.request('PUT', f'/api/v1/messages/{int(message_id)}/progress',
+                        {'phase': phase, 'summary': summary, 'bullets': bullets})
+
   def react(self, mid, emoji, remove=False):
     from urllib.parse import quote
     return self.request('DELETE' if remove else 'PUT',

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Schema v4 adds pinned conversations, per-reader unread counts, live message progress, avatars, host telemetry, pool subscription details and project/task APIs. The connector now reports host statistics and supports the `progress` command. The server serves the bundled KaTeX assets from nested paths.
+
 - **Skill export:** `scripts/export_claude_skill.py` rewrites Markdown links that leave `connectors/lyra-link/` (for example `../../docs/DESIGN.md`) to GitHub URLs, so the exported copy has no broken links; `--ref` selects the branch or tag. Covered by new tests in `scripts/` (`python3 -B -m unittest discover -s scripts -p "test_*.py"`).
 - **Packaging:** `lyra_server.static` is declared as a package, which silences the setuptools warning that unlisted data directories may be dropped from future wheels and keeps the board files installed.
 

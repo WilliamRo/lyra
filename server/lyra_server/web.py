@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 import json
 import logging
+from pathlib import PurePosixPath
 import re
 import socket
 import ssl
@@ -23,7 +24,8 @@ CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' 
        "base-uri 'none'; form-action 'self'")
 STATIC_TYPES = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
                 '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml',
-                '.json': 'application/json'}
+                '.json': 'application/json', '.woff2': 'font/woff2', '.woff': 'font/woff',
+                '.ttf': 'font/ttf', '.png': 'image/png'}
 ADMIN, AGENT, EITHER, PUBLIC = 'admin', 'agent', 'either', 'public'
 
 ROUTES = []
@@ -130,6 +132,8 @@ def h_principal_patch(ctx, pid):
   data = {}
   if 'pool_id' in b:
     data['pool_id'] = _int(b.get('pool_id'))
+  if 'avatar' in b:
+    data['avatar'] = b['avatar']
   if b.get('display_name'):
     data['display_name'] = b['display_name']
   return ctx.app.update_principal(int(pid), data)
@@ -138,13 +142,14 @@ def h_principal_patch(ctx, pid):
 @route('POST', r'/api/v1/admin/pools', ADMIN)
 def h_pool_new(ctx):
   b = ctx.body()
-  return ctx.app.create_pool(b.get('provider'), b.get('label'))
+  return ctx.app.create_pool(b.get('provider'), b.get('label'), b)
 
 
 @route('PATCH', r'/api/v1/admin/pools/(\d+)', ADMIN)
 def h_pool_patch(ctx, pool_id):
   b = ctx.body()
   data = {}
+  data.update({k: b[k] for k in ('account_label', 'subscription', 'notes') if k in b})
   if 'reporter_principal_id' in b:
     data['reporter_principal_id'] = _int(b.get('reporter_principal_id'))
   if b.get('label'):
@@ -155,6 +160,51 @@ def h_pool_patch(ctx, pool_id):
 @route('POST', r'/api/v1/admin/messages/(\d+)/retry', ADMIN)
 def h_retry(ctx, mid):
   return ctx.app.retry(int(mid))
+
+
+@route('GET', r'/api/v1/projects', EITHER)
+def h_projects(ctx):
+  return {'projects': ctx.app.projects_view()}
+
+
+@route('POST', r'/api/v1/projects', EITHER)
+def h_new_project(ctx):
+  return ctx.app.save_project(ctx.principal, ctx.is_admin, ctx.body())
+
+
+@route('PATCH', r'/api/v1/projects/(\d+)', EITHER)
+def h_edit_project(ctx, pid):
+  return ctx.app.save_project(ctx.principal, ctx.is_admin, ctx.body(), pid=int(pid))
+
+
+@route('POST', r'/api/v1/projects/(\d+)/tasks', EITHER)
+def h_new_task(ctx, pid):
+  return ctx.app.save_task(ctx.principal, ctx.is_admin, ctx.body(), pid=int(pid))
+
+
+@route('PATCH', r'/api/v1/tasks/(\d+)', EITHER)
+def h_edit_task(ctx, tid):
+  return ctx.app.save_task(ctx.principal, ctx.is_admin, ctx.body(), tid=int(tid))
+
+
+@route('POST', r'/api/v1/conversations/(\d+)/pin', ADMIN)
+def h_pin(ctx, cid):
+  return ctx.app.pin_conversation(int(cid), True)
+
+
+@route('DELETE', r'/api/v1/conversations/(\d+)/pin', ADMIN)
+def h_unpin(ctx, cid):
+  return ctx.app.pin_conversation(int(cid), False)
+
+
+@route('POST', r'/api/v1/conversations/(\d+)/read', EITHER)
+def h_read(ctx, cid):
+  return ctx.app.mark_read(ctx.principal, int(cid), ctx.body().get('last_read_message_id'), ctx.is_admin)
+
+
+@route('PUT', r'/api/v1/messages/(\d+)/progress', AGENT)
+def h_progress(ctx, mid):
+  return ctx.app.set_progress(ctx.principal, int(mid), ctx.body())
 
 
 @route('GET', r'/api/v1/conversations', EITHER)
@@ -454,13 +504,18 @@ class Handler(BaseHTTPRequestHandler):
     self.wfile.write(data)
 
   def _static(self, name):
-    if '/' in name or name.startswith('.'):
+    name = unquote(name)
+    parts = name.split('/')
+    if any(not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', part) for part in parts):
       return self._json(404, {'error': 'not_found'})
-    res = resources.files('lyra_server').joinpath('static', name)
+    path = PurePosixPath(name)
+    res = resources.files('lyra_server').joinpath('static')
+    for part in path.parts:
+      res = res.joinpath(part)
     if not res.is_file():
       return self._json(404, {'error': 'not_found'})
     data = res.read_bytes()
-    ext = name[name.rfind('.'):] if '.' in name else ''
+    ext = path.suffix.lower()
     self._headers(200, STATIC_TYPES.get(ext, 'application/octet-stream'), len(data),
                   cache='no-cache')
     self.wfile.write(data)

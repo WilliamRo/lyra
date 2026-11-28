@@ -9,17 +9,18 @@ import time
 from . import __version__
 from .accounts import AccountsMixin
 from .attachments import AttachmentMixin
-from .db import Database
+from .db import Database, loads
 from .events import EventLog
 from .messaging import MessagingMixin
 from .registry import RegistryMixin
+from .projects import ProjectsMixin
 from .security import LoginThrottle
 
 
 log = logging.getLogger('lyra')
 
 
-class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin):
+class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin, ProjectsMixin):
   """All business rules; the HTTP layer only authenticates and translates."""
 
   def __init__(self, settings, clock=time.time):
@@ -75,7 +76,7 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin):
     counts = self.waiting_counts(p['id'])
     return {
       'id': p['id'], 'kind': p['kind'], 'handle': p['handle'], 'role': p['role'],
-      'display_name': p['display_name'], 'address': p['address'], 'status': p['status'],
+      'display_name': p['display_name'], 'avatar': loads(p['avatar']), 'address': p['address'], 'status': p['status'],
       'admitted_at': p['admitted_at'], 'revoked_at': p['revoked_at'],
       'pool': ({'id': pool['id'], 'provider': pool['provider'], 'label': pool['label'],
                 'is_reporter': pool['reporter_principal_id'] == p['id']} if pool else None),
@@ -88,16 +89,30 @@ class Lyra(AccountsMixin, RegistryMixin, MessagingMixin, AttachmentMixin):
     agents = self.db.all("SELECT * FROM principals WHERE kind='agent' ORDER BY status, display_name")
     owner = self.owner_principal()
     all_invites = self.list_invites()
+    agents = [self.agent_view(p) for p in agents]
+    hosts = {}
+    for agent in agents:
+      presence = agent['presence']
+      host = presence.get('host')
+      if not host or agent['status'] != 'admitted':
+        continue
+      row = hosts.setdefault(host, {'host': host, 'online_count': 0, 'agent_ids': [], 'last_seen_at': None,
+                                    'metrics': {}, 'metrics_at': None})
+      row['agent_ids'].append(agent['id'])
+      row['online_count'] += int(presence['online'])
+      seen = presence['last_checkin_at']
+      if seen is not None:
+        row['last_seen_at'] = max(seen, row['last_seen_at'] or seen)
+        if presence['host_metrics'] and (row['metrics_at'] is None or seen >= row['metrics_at']):
+          row['metrics'], row['metrics_at'] = presence['host_metrics'], seen
     return {
       'now': now, 'version': __version__,
-      'owner': {'id': owner['id'], 'display_name': owner['display_name']} if owner else None,
+      'owner': {'id': owner['id'], 'display_name': owner['display_name'], 'avatar': loads(owner['avatar'])} if owner else None,
       'consul': self.consul_view(),
-      'agents': [self.agent_view(p) for p in agents],
+      'agents': agents, 'hosts': [hosts[key] for key in sorted(hosts)], 'projects': self.projects_view(),
       'invites': [i for i in all_invites if i['state'] == 'open'],
       'senate_invites': [i for i in all_invites if i.get('issued_by') and i['issued_by']['kind'] == 'agent'],
-      'pools': [{'id': r['id'], 'provider': r['provider'], 'label': r['label'],
-                 'reporter_principal_id': r['reporter_principal_id']}
-                for r in self.db.all('SELECT * FROM pools ORDER BY provider, label')],
+      'pools': [pool for provider in self.usage_view() for pool in provider['pools']],
       'settings': {'max_attachment_bytes': self.settings.max_attachment_bytes,
                    'max_attachments_per_message': self.settings.max_attachments_per_message,
                    'checkin_ttl_sec': self.settings.checkin_ttl_sec,

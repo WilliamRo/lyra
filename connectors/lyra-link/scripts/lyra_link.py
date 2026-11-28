@@ -87,6 +87,13 @@ def main(argv=None):
   r.add_argument('--image', action='append', default=[], metavar='PATH')
   r.add_argument('--mode', choices=('queue', 'jump'))
 
+  pr = sub.add_parser('progress', help='report progress on a received message')
+  pr.add_argument('handle', nargs='?')
+  pr.add_argument('--to', type=int, required=True)
+  pr.add_argument('--phase', choices=('thinking', 'working', 'done'), required=True)
+  pr.add_argument('--summary')
+  pr.add_argument('--bullet', action='append', default=[], metavar='STATE:TEXT')
+
   rc = sub.add_parser('react', help='add or remove an emoji reaction')
   rc.add_argument('handle', nargs='?')
   rc.add_argument('--to', required=True, type=int)
@@ -144,6 +151,14 @@ def main(argv=None):
         out(client.reply(a.to, body, mode=a.mode, client_msg_id=key, attachment_ids=ids))
       else:
         out(client.send(a.to, body, mode=a.mode, client_msg_id=str(uuid.uuid4()), attachment_ids=ids))
+    elif a.cmd == 'progress':
+      bullets = []
+      for item in a.bullet:
+        state, _, text = item.partition(':')
+        if state not in ('active', 'pending', 'done') or not text.strip():
+          raise ValueError('expected --bullet done|active|pending:TEXT')
+        bullets.append({'state': state, 'text': text})
+      out(_client(_resolve(a.handle)).progress(a.to, a.phase, a.summary, bullets or None))
     elif a.cmd == 'react':
       out(_client(_resolve(a.handle)).react(a.to, a.emoji, remove=a.remove))
     elif a.cmd == 'history':

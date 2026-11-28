@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS pools (
   id INTEGER PRIMARY KEY,
   provider TEXT NOT NULL,
   label TEXT NOT NULL,
+  account_label TEXT,
+  subscription TEXT,
+  notes TEXT,
   reporter_principal_id INTEGER,
   usage TEXT,
   reported_at REAL,
@@ -41,6 +44,7 @@ CREATE TABLE IF NOT EXISTS principals (
   kind TEXT NOT NULL,              -- owner | agent
   handle TEXT,
   display_name TEXT NOT NULL,
+  avatar TEXT,
   address TEXT,
   status TEXT NOT NULL,            -- admitted | revoked
   role TEXT,                       -- NULL | consul (single active holder)
@@ -96,6 +100,7 @@ CREATE TABLE IF NOT EXISTS presence (
   modes TEXT,
   status TEXT,
   capabilities TEXT,
+  host_metrics TEXT,
   last_checkin_at REAL,
   online INTEGER NOT NULL DEFAULT 0
 );
@@ -104,6 +109,8 @@ CREATE TABLE IF NOT EXISTS conversations (
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,              -- owner_agent | agent_agent
   dm_pair_key TEXT NOT NULL UNIQUE,
+  pinned INTEGER NOT NULL DEFAULT 0,
+  pinned_at REAL,
   created_at REAL NOT NULL
 );
 
@@ -180,3 +187,54 @@ CREATE TABLE IF NOT EXISTS message_attachments (
   PRIMARY KEY (message_id, attachment_id)
 );
 CREATE INDEX IF NOT EXISTS ix_message_attachments_msg ON message_attachments(message_id, position);
+
+CREATE TABLE IF NOT EXISTS conversation_reads (
+  principal_id INTEGER NOT NULL REFERENCES principals(id),
+  conversation_id INTEGER NOT NULL REFERENCES conversations(id),
+  last_read_message_id INTEGER NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL,
+  PRIMARY KEY (principal_id, conversation_id)
+);
+CREATE TABLE IF NOT EXISTS message_progress (
+  message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+  phase TEXT NOT NULL,
+  summary TEXT,
+  bullets TEXT,
+  updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  id INTEGER PRIMARY KEY,
+  slug TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  pm_principal_id INTEGER REFERENCES principals(id),
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_members (
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  principal_id INTEGER NOT NULL REFERENCES principals(id),
+  role TEXT NOT NULL DEFAULT 'member',
+  joined_at REAL NOT NULL,
+  PRIMARY KEY (project_id, principal_id)
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id),
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT NOT NULL DEFAULT 'open',
+  priority INTEGER NOT NULL DEFAULT 0,
+  created_by_principal_id INTEGER REFERENCES principals(id),
+  created_at REAL NOT NULL,
+  updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_tasks_project ON tasks(project_id, id);
+CREATE TABLE IF NOT EXISTS task_assignees (
+  task_id INTEGER NOT NULL REFERENCES tasks(id),
+  principal_id INTEGER NOT NULL REFERENCES principals(id),
+  assigned_at REAL NOT NULL,
+  PRIMARY KEY (task_id, principal_id)
+);

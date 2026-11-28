@@ -44,6 +44,23 @@ def is_alive(pid):
   if not pid:
     return False
   try:
+    if os.name == 'nt':
+      # Signal zero is a console control event on Windows. Query the handle instead.
+      import ctypes
+      from ctypes import wintypes
+      kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+      kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+      kernel.OpenProcess.restype = wintypes.HANDLE
+      kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+      kernel.WaitForSingleObject.restype = wintypes.DWORD
+      kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+      handle = kernel.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+      if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER means no such PID
+      try:
+        return kernel.WaitForSingleObject(handle, 0) != 0
+      finally:
+        kernel.CloseHandle(handle)
     os.kill(int(pid), 0)
     return True
   except ProcessLookupError:

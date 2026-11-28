@@ -2,7 +2,9 @@
 # registry.py: One-time invites, credentials, check-ins, presence, usage pools.
 # =============================================================================
 
+import math
 import re
+import unicodedata
 
 from . import security
 from .db import dumps, loads
@@ -19,6 +21,62 @@ def _clip(value, limit):
   if value is None:
     return None
   return str(value).strip()[:limit] or None
+
+
+def clean_avatar(value):
+  if value is None:
+    return None
+  def safe_icon(icon):
+    return (isinstance(icon, str) and bool(icon.strip()) and all(
+      ch in '-_ \u200d' or unicodedata.category(ch)[0] in 'LNMS' and ch not in '<>=$'
+      for ch in icon))
+  if isinstance(value, dict):
+    if (not value or set(value) - {'icon', 'color'} or
+        ('icon' in value and not safe_icon(value['icon'])) or
+        ('color' in value and (not isinstance(value['color'], str) or not re.fullmatch(
+          r'(?:#[0-9a-fA-F]{3,4}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8}|[A-Za-z][A-Za-z0-9-]{0,31})',
+          value['color'])))):
+      raise ApiError(422, 'bad_avatar', 'expected a safe icon and color')
+  elif not safe_icon(value):
+    raise ApiError(422, 'bad_avatar', 'invalid avatar preset')
+  encoded = dumps(value)
+  if len(encoded.encode('utf-8')) > 128:
+    raise ApiError(422, 'bad_avatar', 'avatar exceeds 128 bytes')
+  return encoded
+
+
+def clean_host_metrics(data):
+  if not isinstance(data, dict):
+    return {}
+  metrics = {}
+  for key in ('os', 'arch', 'ip'):
+    value = data.get(key)
+    if isinstance(value, str) and value.strip():
+      metrics[key] = value.strip()[:128]
+  cpu = data.get('cpu_count')
+  if type(cpu) is int and cpu >= 1:
+    metrics['cpu_count'] = min(cpu, 65536)
+  for key in ('mem_total_gb', 'mem_used_gb', 'mem_free_gb', 'mem_used_pct', 'disk_total_gb',
+              'disk_free_gb', 'disk_used_pct', 'uptime_sec'):
+    value = data.get(key)
+    if type(value) in (float, int) and 0 <= value <= 1e20 and math.isfinite(value):
+      metrics[key] = min(100.0, float(value)) if key.endswith('_pct') else float(value)
+  return metrics
+
+
+def _metrics_summary(metrics):
+  return (bool(metrics), metrics.get('os'), metrics.get('arch'), metrics.get('ip'), metrics.get('cpu_count'),
+          *(int(metrics.get(key, -10) // 10) for key in ('mem_used_pct', 'disk_used_pct')))
+
+
+def _pool_metadata(data):
+  result = {}
+  for key, limit in (('account_label', 128), ('subscription', 128), ('notes', 1000)):
+    if key in data:
+      if data[key] is not None and not isinstance(data[key], str):
+        raise ApiError(422, 'bad_pool', key + ' must be text')
+      result[key] = _clip(data[key], limit)
+  return result
 
 
 def clean_capabilities(caps):
@@ -300,9 +358,11 @@ class RegistryMixin:
 
   def update_principal(self, pid, data):
     with self.db.tx() as c:
-      p = c.execute("SELECT * FROM principals WHERE id=? AND kind='agent'", (pid,)).fetchone()
-      if not p:
+      p = c.execute('SELECT * FROM principals WHERE id=?', (pid,)).fetchone()
+      if not p or (p['kind'] != 'agent' and set(data) != {'avatar'}):
         raise ApiError(404, 'no_principal', 'unknown agent')
+      if 'avatar' in data:
+        c.execute('UPDATE principals SET avatar=? WHERE id=?', (clean_avatar(data['avatar']), pid))
       if 'pool_id' in data:
         pool_id = data['pool_id']
         if pool_id is not None and not c.execute('SELECT 1 FROM pools WHERE id=?',
@@ -331,15 +391,16 @@ class RegistryMixin:
       pid, _clip(data.get('instance_id'), 120), _clip(data.get('host'), 120),
       _clip(data.get('provider'), 40), _clip(data.get('runtime'), 40),
       _clip(data.get('connector'), 60), dumps(clean_modes(data.get('modes'))), dumps(status),
-      dumps(clean_capabilities(data.get('capabilities'))), now if online else None, 1 if online else 0,
+      dumps(clean_capabilities(data.get('capabilities'))), dumps(clean_host_metrics(data.get('host_metrics'))),
+      now if online else None, 1 if online else 0,
     )
     c.execute(
       'INSERT INTO presence(principal_id, instance_id, host, provider, runtime, connector, modes, '
-      'status, capabilities, last_checkin_at, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+      'status, capabilities, host_metrics, last_checkin_at, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
       'ON CONFLICT(principal_id) DO UPDATE SET instance_id=excluded.instance_id, '
       'host=COALESCE(excluded.host, host), provider=COALESCE(excluded.provider, provider), '
       'runtime=COALESCE(excluded.runtime, runtime), connector=COALESCE(excluded.connector, connector), '
-      'modes=excluded.modes, status=excluded.status, capabilities=excluded.capabilities, '
+      'modes=excluded.modes, status=excluded.status, capabilities=excluded.capabilities, host_metrics=excluded.host_metrics, '
       'last_checkin_at=COALESCE(excluded.last_checkin_at, last_checkin_at), online=excluded.online',
       row,
     )
@@ -360,10 +421,12 @@ class RegistryMixin:
       old_status = loads(prev['status'], {}) if prev else {}
       was_online = bool(prev and prev['online'])
       self._upsert_presence(c, pid, data, now, online=True)
-      cur = c.execute('SELECT modes, status, capabilities FROM presence WHERE principal_id=?', (pid,)).fetchone()
+      cur = c.execute('SELECT host, modes, status, capabilities, host_metrics FROM presence WHERE principal_id=?', (pid,)).fetchone()
       if not was_online:
         self.events.append(c, 'presence', id=pid, online=True)
-      elif clean_capabilities(loads(prev['capabilities'])) != loads(cur['capabilities']) or \
+      elif cur['host'] != prev['host'] or \
+          _metrics_summary(loads(prev['host_metrics'], {})) != _metrics_summary(loads(cur['host_metrics'], {})) or \
+          clean_capabilities(loads(prev['capabilities'])) != loads(cur['capabilities']) or \
           loads(cur['modes'], []) != old_modes or \
           loads(cur['status'], {}).get('busy') != old_status.get('busy'):
         self.events.append(c, 'presence', id=pid, online=True, changed=True)
@@ -397,14 +460,14 @@ class RegistryMixin:
     r = self.db.one('SELECT * FROM presence WHERE principal_id=?', (pid,))
     if not r:
       return {'online': False, 'last_checkin_at': None, 'modes': ['queue'], 'status': {},
-              'capabilities': clean_capabilities(None)}
+              'capabilities': clean_capabilities(None), 'host_metrics': {}}
     online = bool(r['online'] and r['last_checkin_at'] is not None and self.now() - r['last_checkin_at']
                   <= self.settings.checkin_ttl_sec)
     return {
       'online': online, 'last_checkin_at': r['last_checkin_at'], 'instance_id': r['instance_id'],
       'host': r['host'], 'provider': r['provider'], 'runtime': r['runtime'],
       'connector': r['connector'], 'modes': loads(r['modes'], ['queue']),
-      'status': loads(r['status'], {}),
+      'status': loads(r['status'], {}), 'host_metrics': loads(r['host_metrics'], {}),
       'capabilities': clean_capabilities(loads(r['capabilities']) if online else None),
     }
 
@@ -422,7 +485,7 @@ class RegistryMixin:
       pres = self.presence_view(p['id']) if p['kind'] == 'agent' else None
       out.append({
         'handle': p['handle'], 'display_name': p['display_name'], 'kind': p['kind'],
-        'role': p['role'],
+        'role': p['role'], 'avatar': loads(p['avatar']),
         'online': pres['online'] if pres else None,
         'capabilities': pres['capabilities'] if pres else {'images': True},
         'modes': pres['modes'] if pres else ['queue'],
@@ -432,15 +495,17 @@ class RegistryMixin:
 
   # --- usage pools ---------------------------------------------------------
 
-  def create_pool(self, provider, label):
+  def create_pool(self, provider, label, metadata=None):
     provider = _clip(provider, 40)
     label = _clip(label, 80)
     if not provider or not label:
       raise ApiError(422, 'bad_pool', 'provider and label are required')
     try:
       with self.db.tx() as c:
-        cur = c.execute('INSERT INTO pools(provider, label, created_at) VALUES (?, ?, ?)',
-                        (provider, label, self.now()))
+        meta = _pool_metadata(metadata or {})
+        cur = c.execute('INSERT INTO pools(provider,label,account_label,subscription,notes,created_at) '
+                        'VALUES (?,?,?,?,?,?)', (provider, label, meta.get('account_label'),
+                        meta.get('subscription'), meta.get('notes'), self.now()))
         self.events.append(c, 'pool', id=cur.lastrowid, action='created')
     except Exception as exc:  # noqa: BLE001 - unique violation
       if 'UNIQUE' in str(exc):
@@ -454,6 +519,8 @@ class RegistryMixin:
       pool = c.execute('SELECT * FROM pools WHERE id=?', (pool_id,)).fetchone()
       if not pool:
         raise ApiError(404, 'no_pool', 'unknown pool')
+      for field, value in _pool_metadata(data).items():
+        c.execute(f'UPDATE pools SET {field}=? WHERE id=?', (value, pool_id))
       if 'reporter_principal_id' in data:
         rid = data['reporter_principal_id']
         if rid is not None:
@@ -488,7 +555,8 @@ class RegistryMixin:
         stale = not pres['online'] or not pool['reported_at'] or now - pool['reported_at'] > 600
       providers.setdefault(pool['provider'], []).append({
         'id': pool['id'], 'provider': pool['provider'], 'label': pool['label'],
-        'reporter': reporter, 'usage': loads(pool['usage'], None),
+        'account_label': pool['account_label'], 'subscription': pool['subscription'], 'notes': pool['notes'],
+        'reporter_principal_id': pool['reporter_principal_id'], 'reporter': reporter, 'usage': loads(pool['usage'], None),
         'reported_at': pool['reported_at'], 'stale': stale,
         'members': [{'id': m['id'], 'display_name': m['display_name'], 'status': m['status']}
                     for m in members],

@@ -63,3 +63,7 @@ vi. On `revoked`, stop and tell the owner through another channel; do not re-joi
 Use `<cli> send <handle> --to owner --image chart.png` for an image-only message. Repeat `--image PATH` to attach several files in order. For a caption, add `--stdin` and pipe the text. Replies use the same options, for example `<cli> reply <handle> --to 42 --image chart.png`. The default server limits are four images and 10 MiB per image. Supported formats are PNG, JPEG, GIF and WebP.
 
 Join with `--no-images` for a text-only session. `check` shows the configured and reported capabilities, and `teammates` shows which recipients accept images. When a message event contains `attachments`, use each `local_path` to inspect the downloaded image. If an item has `download_error`, report the missing image when it affects the answer. The rest of the message is still delivered.
+
+## 6. Reporting work in progress
+
+Use `<cli> progress <handle> --to 42 --phase working --summary "Checking the figures" --bullet done:Inputs --bullet "active:Verify totals"` to update an incoming message. The optional handle defaults to the linked session. Repeat `--bullet` for up to 12 items. A reply closes active progress in its conversation. Use `--phase done` to end the indicator separately. Check-ins also report available host statistics.

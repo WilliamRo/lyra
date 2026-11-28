@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import lyra_link
-from lyralib import activity, client, daemon, link, status, store, stream  # noqa: E402
+from lyralib import activity, client, daemon, link, procwatch, status, store, stream, telemetry  # noqa: E402
 from lyralib.client import LyraError  # noqa: E402
 
 SELF = os.getpid()
@@ -157,6 +157,53 @@ class ImageConnectorTests(Base):
       self.assertNotEqual(keys[0], keys[1])
       self.assertEqual(keys[1], keys[2])
       self.assertEqual(lyra_link.main(['send', 'vision', '--to', 'owner']), 1)
+
+
+class ProgressAndMetricsTests(Base):
+  def test_cli_and_client_progress_payload(self):
+    c = client.Client('http://localhost')
+    c.request = Mock(return_value={'ok': True})
+    with patch.object(lyra_link, '_client', return_value=c), patch.object(lyra_link, 'out'):
+      args = ['progress', 'vision', '--to', '17', '--phase', 'working', '--summary', 'Testing']
+      self.assertEqual(lyra_link.main(args + ['--bullet', 'done:setup', '--bullet', 'active:test:run']), 0)
+      self.assertEqual(c.request.call_args.args, ('PUT', '/api/v1/messages/17/progress', {
+        'phase': 'working', 'summary': 'Testing', 'bullets': [{'state': 'done', 'text': 'setup'},
+                                                            {'state': 'active', 'text': 'test:run'}]}))
+      self.assertEqual(lyra_link.main(args + ['--bullet', 'bad']), 1)
+      self.assertEqual(c.request.call_count, 1)
+
+  def test_checkin_host_metrics_are_optional_per_field(self):
+    with patch.object(daemon, 'host_metrics', return_value={'os': 'Linux', 'cpu_count': 8}):
+      payload = daemon.checkin_payload('vision', {}, SELF)
+      self.assertEqual(payload['host_metrics'], {'os': 'Linux', 'cpu_count': 8})
+    with patch.object(telemetry.shutil, 'disk_usage', side_effect=OSError()), \
+         patch.object(telemetry.socket, 'gethostbyname_ex', side_effect=OSError()):
+      metrics = telemetry.host_metrics()
+    self.assertTrue(metrics['os'])
+    self.assertNotIn('ip', metrics)
+    self.assertNotIn('disk_total_gb', metrics)
+
+  def test_linux_memory_and_uptime(self):
+    def read(path):
+      return '110.5 50' if path.name == 'uptime' else 'MemTotal: 2048 kB\nMemAvailable: 1024 kB\n'
+    with patch.object(Path, 'read_text', read):
+      metrics = {}
+      total, available = telemetry._linux(metrics)
+    self.assertEqual((total, available, metrics['uptime_sec']), (2097152, 1048576, 110.5))
+
+  def test_macos_memory_and_uptime(self):
+    with patch.object(telemetry.subprocess, 'check_output', side_effect=[
+        '{ sec = 500, usec = 0 }', '16777216', 'page size of 4096 bytes\nPages free: 100.\nPages inactive: 40.']), \
+        patch.object(telemetry.time, 'time', return_value=620):
+      metrics = {}
+      total, available = telemetry._mac(metrics)
+    self.assertEqual((total, available, metrics['uptime_sec']), (16777216, 140 * 4096, 120.0))
+
+  @unittest.skipUnless(os.name == 'nt', 'Windows process handles')
+  def test_windows_liveness_query_does_not_signal_the_console(self):
+    with patch.object(os, 'kill', side_effect=AssertionError('unexpected signal')):
+      self.assertTrue(procwatch.is_alive(SELF))
+      self.assertFalse(procwatch.is_alive(999999))
 
 
 class FakeClient:

@@ -34,3 +34,7 @@ The connector advertises `capabilities.images` at join and on each check-in. The
 The CLI uploads files as raw bytes, then sends their ordered IDs in a single message. The reply idempotency key includes the attachment IDs, so a different image on the same parent can produce a distinct reply. Reuse the same IDs and client message ID to retry the same request. Unused uploads expire server-side.
 
 Before handoff, the stream downloads each attachment into the handle’s `attachments` directory, selects its local extension from its media type, and checks the SHA-256 digest. The emitted attachment includes either an absolute `local_path` or a `download_error`. A failed file does not prevent delivery of text or other images. Duplicate-lease reconciliation runs before downloads.
+
+## 5. Telemetry and message progress
+
+The daemon samples CPU count, memory, disk and uptime on check-in. Linux uses procfs, Windows uses system memory and uptime APIs, and macOS uses sysctl and vm_stat. Unavailable measurements are omitted. The `progress` command sends recipient-authenticated updates for a message independently of the stream's delivery ledger.

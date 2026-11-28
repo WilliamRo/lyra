@@ -7,6 +7,7 @@ import threading
 import time
 import unicodedata
 
+from .db import dumps, loads
 from .events import ApiError
 
 
@@ -143,6 +144,13 @@ class MessagingMixin:
          'delivered' if to_owner else 'waiting', client_msg_id, now, now if to_owner else None),
       )
       self.bind_attachments(c, ids, cur.lastrowid, sender['id'])
+      if sender['kind'] == 'agent' and (reply_to_id is not None or to_owner):
+        active = c.execute("""SELECT p.message_id FROM message_progress p JOIN messages m
+            ON m.id=p.message_id WHERE m.conversation_id=? AND m.recipient_id=? AND p.phase!='done'""",
+                           (conv['id'], sender['id'])).fetchall()
+        for row in active:
+          c.execute("UPDATE message_progress SET phase='done', updated_at=? WHERE message_id=?", (now, row[0]))
+          self.events.append(c, 'message_progress', id=row[0], conversation_id=conv['id'], phase='done')
       self.events.append(c, 'message', id=cur.lastrowid, conversation_id=conv['id'],
                          state='delivered' if to_owner else 'waiting')
       view = self.message_view(cur.lastrowid, c=c)
@@ -154,6 +162,76 @@ class MessagingMixin:
   def reply(self, sender, message_id, body, mode=None, client_msg_id=None, attachment_ids=None):
     return self.send(sender, None, body, mode=mode, client_msg_id=client_msg_id,
                      reply_to_id=int(message_id), attachment_ids=attachment_ids)
+
+  def set_progress(self, actor, mid, data):
+    phase = data.get('phase')
+    if phase not in ('thinking', 'working', 'done'):
+      raise ApiError(422, 'bad_progress', 'unknown progress phase')
+    summary = data.get('summary')
+    if summary is not None and not isinstance(summary, str):
+      raise ApiError(422, 'bad_progress', 'summary must be text')
+    summary = summary[:240] if summary else None
+    bullets = data.get('bullets')
+    if bullets is not None:
+      if not isinstance(bullets, list) or len(bullets) > 12:
+        raise ApiError(422, 'bad_progress', 'expected at most 12 bullets')
+      cleaned = []
+      for b in bullets:
+        if (not isinstance(b, dict) or not isinstance(b.get('text'), str) or not b['text'].strip()
+            or b.get('state') not in ('done', 'active', 'pending')):
+          raise ApiError(422, 'bad_progress', 'invalid progress bullet')
+        cleaned.append({'text': b['text'][:200], 'state': b['state']})
+      bullets = cleaned
+    now = self.now()
+    with self.db.tx() as c:
+      m = c.execute('SELECT recipient_id, conversation_id FROM messages WHERE id=?', (mid,)).fetchone()
+      if not m:
+        raise ApiError(404, 'no_message', 'unknown message')
+      if m['recipient_id'] != actor['id']:
+        raise ApiError(403, 'not_recipient', 'only the recipient can update progress')
+      c.execute("""INSERT INTO message_progress VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
+          phase=excluded.phase, summary=excluded.summary, bullets=excluded.bullets, updated_at=excluded.updated_at""",
+                (mid, phase, summary, dumps(bullets) if bullets is not None else None, now))
+      self.events.append(c, 'message_progress', id=mid, conversation_id=m['conversation_id'], phase=phase)
+    self.events.notify()
+    return {'ok': True, 'progress': {'phase': phase, 'summary': summary, 'bullets': bullets, 'updated_at': now}}
+
+  def pin_conversation(self, cid, pinned):
+    with self.db.tx() as c:
+      row = c.execute('SELECT pinned, pinned_at FROM conversations WHERE id=?', (cid,)).fetchone()
+      if row is None:
+        raise ApiError(404, 'no_conversation', 'unknown conversation')
+      at = row['pinned_at']
+      if bool(row['pinned']) != pinned:
+        at = self.now() if pinned else None
+        c.execute('UPDATE conversations SET pinned=?, pinned_at=? WHERE id=?', (int(pinned), at, cid))
+        self.events.append(c, 'conversation', id=cid, conversation_id=cid, pinned=pinned)
+    self.events.notify()
+    return {'pinned': pinned, 'pinned_at': at}
+
+  def mark_read(self, viewer, cid, mid, admin=False):
+    with self.db.tx() as c:
+      if not c.execute('SELECT 1 FROM conversations WHERE id=?', (cid,)).fetchone():
+        raise ApiError(404, 'no_conversation', 'unknown conversation')
+      if not admin and not self._is_member(c, cid, viewer['id']):
+        raise ApiError(403, 'not_member', 'you are not in this conversation')
+      if mid is None:
+        mid = c.execute('SELECT COALESCE(MAX(id),0) FROM messages WHERE conversation_id=?', (cid,)).fetchone()[0]
+      elif type(mid) is not int or not 0 <= mid < 2**63 or (mid and not c.execute(
+          'SELECT 1 FROM messages WHERE conversation_id=? AND id=?', (cid, mid)).fetchone()):
+        raise ApiError(422, 'bad_read_cursor', 'expected a message ID from this conversation')
+      key = (viewer['id'], cid)
+      previous = c.execute('SELECT last_read_message_id FROM conversation_reads WHERE principal_id=? AND conversation_id=?',
+                           key).fetchone()
+      if previous is None or previous[0] < mid:
+        c.execute("""INSERT INTO conversation_reads VALUES (?,?,?,?) ON CONFLICT(principal_id,conversation_id)
+            DO UPDATE SET last_read_message_id=excluded.last_read_message_id, updated_at=excluded.updated_at""",
+                  (*key, mid, self.now()))
+        self.events.append(c, 'conversation', id=cid, conversation_id=cid, principal_id=viewer['id'])
+      else:
+        mid = previous[0]
+    self.events.notify()
+    return {'conversation_id': cid, 'last_read_message_id': mid}
 
   # --- reactions -----------------------------------------------------------
 
@@ -191,6 +269,7 @@ class MessagingMixin:
   def message_view(self, mid, c=None):
     q = ('SELECT m.*, s.display_name AS sender_name, s.handle AS sender_handle, '
          's.kind AS sender_kind, r.display_name AS recipient_name, r.handle AS recipient_handle, '
+         's.avatar AS sender_avatar, r.avatar AS recipient_avatar, s.role AS sender_role, r.role AS recipient_role, '
          'r.kind AS recipient_kind, cv.kind AS conversation_kind FROM messages m '
          'JOIN principals s ON s.id = m.sender_id JOIN principals r ON r.id = m.recipient_id '
          'JOIN conversations cv ON cv.id = m.conversation_id WHERE m.id=?')
@@ -207,10 +286,11 @@ class MessagingMixin:
     return {
       'id': m['id'], 'conversation_id': m['conversation_id'],
       'conversation_kind': m['conversation_kind'],
+      'progress': self._progress_view(mid),
       'sender': {'id': m['sender_id'], 'display_name': m['sender_name'],
-                 'handle': m['sender_handle'], 'kind': m['sender_kind']},
+                 'handle': m['sender_handle'], 'kind': m['sender_kind'], 'role': m['sender_role'], 'avatar': loads(m['sender_avatar'])},
       'recipient': {'id': m['recipient_id'], 'display_name': m['recipient_name'],
-                    'handle': m['recipient_handle'], 'kind': m['recipient_kind']},
+                    'handle': m['recipient_handle'], 'kind': m['recipient_kind'], 'role': m['recipient_role'], 'avatar': loads(m['recipient_avatar'])},
       'attachments': self.message_attachments(mid),
       'body': m['body'], 'reply_to': reply_to, 'mode': m['mode'], 'state': m['state'],
       'state_reason': m['state_reason'], 'attempts': m['attempts'], 'retry': bool(m['retry']),
@@ -218,6 +298,10 @@ class MessagingMixin:
       'failed_at': m['failed_at'], 'reactions': self._reactions(m['id'], c=c),
       'queue_position': self._queue_position(m, c) if m['state'] == 'waiting' else None,
     }
+
+  def _progress_view(self, mid):
+    row = self.db.one("SELECT phase,summary,bullets,updated_at FROM message_progress WHERE message_id=? AND phase!='done'", (mid,))
+    return {**dict(row), 'bullets': loads(row['bullets'])} if row else None
 
   def _queue_position(self, m, c=None):
     q = ("SELECT COUNT(*) FROM messages WHERE recipient_id=? AND state='waiting' AND "
@@ -236,21 +320,28 @@ class MessagingMixin:
                          (viewer['id'],))
     out = []
     for cv in rows:
-      members = self.db.all('SELECT p.id, p.display_name, p.handle, p.kind, p.status FROM '
+      members = self.db.all('SELECT p.id, p.display_name, p.handle, p.kind, p.status, p.role, p.avatar FROM '
                             'conversation_members cm JOIN principals p ON p.id = cm.principal_id '
                             'WHERE cm.conversation_id=? ORDER BY p.kind DESC, p.display_name',
                             (cv['id'],))
       last = self.db.one('SELECT id, body, created_at, sender_id FROM messages WHERE '
                          'conversation_id=? ORDER BY id DESC LIMIT 1', (cv['id'],))
       member_ids = [m['id'] for m in members]
+      cursor = self.db.one('SELECT last_read_message_id FROM conversation_reads WHERE principal_id=? AND conversation_id=?',
+                           (viewer['id'], cv['id']))
+      mid = cursor[0] if cursor else 0
+      unread = self.db.one('SELECT COUNT(*) FROM messages WHERE conversation_id=? AND id>? AND sender_id!=?',
+                           (cv['id'], mid, viewer['id']))[0]
       out.append({
         'id': cv['id'], 'kind': cv['kind'],
-        'members': [dict(m) for m in members],
+        'pinned': bool(cv['pinned']), 'pinned_at': cv['pinned_at'], 'unread_count': unread, 'last_read_message_id': mid,
+        'members': [{**dict(m), 'avatar': loads(m['avatar'])} for m in members],
         'read_only': viewer['kind'] == 'owner' and viewer['id'] not in member_ids,
         'last': ({'id': last['id'], 'excerpt': self.excerpt(last, 120), 'created_at': last['created_at'],
                   'sender_id': last['sender_id']} if last else None),
       })
-    out.sort(key=lambda x: -(x['last']['created_at'] if x['last'] else 0))
+    out.sort(key=lambda x: (not x['pinned'], -(x['pinned_at'] or 0) if x['pinned'] else
+                            -(x['last']['created_at'] if x['last'] else 0), -x['id']))
     return out
 
   def conversation_messages(self, viewer, conv_id, after=0, limit=200, include_all=False):
@@ -365,6 +456,13 @@ class MessagingMixin:
                 (outcome, now, att['id']))
       if outcome == 'delivered':
         self._set_state(c, m['id'], 'delivered', None, now)
+        # A fast reply can arrive before the transport acknowledges the handoff.
+        answered = c.execute("""SELECT 1 FROM messages WHERE conversation_id=? AND sender_id=? AND id>?
+            AND (reply_to_id=? OR recipient_id IN (SELECT id FROM principals WHERE kind='owner')) LIMIT 1""",
+                             (m['conversation_id'], agent['id'], m['id'], m['id'])).fetchone()
+        if not answered and c.execute("INSERT OR IGNORE INTO message_progress(message_id,phase,updated_at) "
+                                      "VALUES (?,'thinking',?)", (m['id'], now)).rowcount:
+          self.events.append(c, 'message_progress', id=m['id'], conversation_id=m['conversation_id'], phase='thinking')
       elif outcome == 'unconfirmed':
         self._set_state(c, m['id'], 'unconfirmed',
                         _clip_reason(reason) or 'handoff could not be confirmed', now)

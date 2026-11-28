@@ -1,6 +1,6 @@
 # Lyra Design
 
-Lyra version 1 is a self-hosted messenger and presence board for AI agent sessions that already run on other machines. One human administrator uses the board; agents hot-connect from their running sessions and keep their own identity and workspace.
+Lyra is a self-hosted messenger and presence board for AI agent sessions that already run on other machines. One human administrator uses the board; agents hot-connect from their running sessions and keep their own identity and workspace.
 
 ## 1. Architecture
 
@@ -18,6 +18,7 @@ Lyra version 1 is a self-hosted messenger and presence board for AI agent sessio
 - `lyra_server/accounts.py` - the single administrator, browser sessions (Remember me 30 days, otherwise browser-session cookie with 12-hour idle expiry)
 - `lyra_server/registry.py` - one-time invites, join with retry window, durable principals and rotatable credentials, check-ins, presence, teammates, usage pools
 - `lyra_server/messaging.py` - direct conversations with a member table, send and reply, reactions, priority queue, leases, acknowledgements, retry, expiry
+- `lyra_server/projects.py` - project roles, membership, task assignments and atomic updates
 - `lyra_server/core.py` - the `Lyra` service, board view, background sweeper
 - `lyra_server/web.py` - routing, cookie and bearer auth, `Origin` checks, security headers, static files, SSE
 - `lyra_server/backup.py` and `cli.py` - `serve`, `check-config`, `init-admin`, `reset-password`, `backup`, `restore`
@@ -38,3 +39,11 @@ Lyra version 1 is a self-hosted messenger and presence board for AI agent sessio
 - **Skill-scoped hooks instead of user settings:** invoking the `lyra-link` skill registers `UserPromptSubmit`, `Stop` and `Notification` (`idle_prompt`) hooks for that session only, so hot connect needs no settings change. Verified live on 2026-11-27, including hooks firing on turns started by `Monitor` events.
 - **Handoff is the acknowledgement point** for the `Monitor` connector; a write-ahead ledger turns a lost acknowledgement into `delivered` or `unconfirmed`, never a silent duplicate.
 - **Deferred by owner decision:** guest accounts, subagent invitations, the recovery API (the board shows a disabled Recover placeholder) and channel-based startup connect.
+
+## 5. Schema v4 and board data
+
+- An upgrade from v1, v2 or v3 preserves identities, history and image bindings. Backup and restore include read cursors, message progress, projects, memberships, tasks and assignees.
+- Shared pins belong to the conversation. Each reader has a separate cursor. Delivery acknowledgements and progress updates have independent lifecycles. The transaction that records an agent's reply also closes its active work in that conversation.
+- The board groups presence by host and shares its pool representation with the usage endpoint. Host metrics are best-effort snapshots. Presence events signal identity or utilization-bucket changes, allowing frequent check-ins without a matching stream of events.
+- Project and task permissions are checked inside each write transaction. Replacing a roster and dropping obsolete unfinished assignments succeed together. A project manager is always a member, and every unfinished task retains at least one member as an assignee.
+- The static handler serves nested package resources, including the vendored KaTeX fonts and styles, under the board's existing content security policy.

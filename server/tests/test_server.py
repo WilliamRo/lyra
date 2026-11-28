@@ -627,6 +627,239 @@ class AttachmentTests(ServerCase):
       self.assertEqual((target.parent / 'attachments' / kept_path).read_bytes(), self.png)
 
 
+class StageOneTests(ServerCase):
+  def api(self, client, method, path, body=None, expected=200):
+    status, result = client.call(method, '/api/v1/' + path, body)
+    self.assertEqual(status, expected, (method, path, result))
+    return result
+
+  def test_read_cursors_pins_and_member_identity(self):
+    o = self.owner()
+    a, b = (self.agent(o, h) for h in ('reader', 'observer'))
+    icon = {'icon': 'star', 'color': '#aa00ff'}
+    self.api(o, 'PATCH', f'admin/principals/{a.pid}', {'avatar': icon})
+    self.api(o, 'POST', 'senate/consul', {'principal_id': a.pid})
+    m = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'first'})['message']
+    self.assertEqual(m['recipient']['avatar'], icon)
+    cid = m['conversation_id']
+    first = m['id']
+    second = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'second'})['message']['id']
+    other = self.api(b, 'POST', 'messages', {'to': 'owner', 'body': 'other'})['message']
+    def conversation(client):
+      return next(x for x in self.api(client, 'GET', 'conversations')['conversations'] if x['id'] == cid)
+    self.assertEqual(conversation(a)['unread_count'], 2)
+    self.assertEqual(conversation(o)['unread_count'], 0)
+    member = next(m for m in conversation(a)['members'] if m['id'] == a.pid)
+    self.assertEqual((member['role'], member['avatar']), ('consul', icon))
+    read = f'conversations/{cid}/read'
+    self.api(b, 'POST', read, {}, 403)
+    self.api(a, 'POST', read, {'last_read_message_id': other['id']}, 422)
+    self.assertEqual(self.api(a, 'POST', read, {'last_read_message_id': first})['last_read_message_id'], first)
+    self.assertEqual(conversation(a)['unread_count'], 1)
+    self.assertEqual(self.api(a, 'POST', read)['last_read_message_id'], second)
+    self.assertEqual(self.api(a, 'POST', read, {'last_read_message_id': first})['last_read_message_id'], second)
+    self.assertEqual(conversation(a)['unread_count'], 0)
+    cursor = self.app.events.latest_id()
+    pin = f'conversations/{cid}/pin'
+    self.api(a, 'POST', pin, {}, 401)
+    self.assertTrue(self.api(o, 'POST', pin)['pinned'])
+    self.assertEqual(self.api(o, 'GET', 'conversations')['conversations'][0]['id'], cid)
+    self.assertIsNotNone(conversation(o)['pinned_at'])
+    self.assertEqual(self.api(o, 'DELETE', pin), {'pinned': False, 'pinned_at': None})
+    self.assertEqual([e['type'] for e in self.app.events.since(cursor)], ['conversation', 'conversation'])
+    team = self.api(a, 'POST', 'messages', {'to': b.pid, 'body': 'team'})['message']
+    self.assertEqual(self.api(o, 'POST', f"conversations/{team['conversation_id']}/read")['last_read_message_id'], team['id'])
+
+  def test_progress_permissions_clipping_acks_and_replies(self):
+    o = self.owner()
+    a, b = (self.agent(o, h) for h in ('worker', 'bystander'))
+    m = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'job'})['message']
+    self.assertIsNone(m['progress'])
+    mid = m['id']
+    path = f'messages/{mid}/progress'
+    def view():
+      return self.app.message_view(mid)['progress']
+    self.api(b, 'PUT', path, {'phase': 'done'}, 403)
+    self.api(o, 'PUT', path, {'phase': 'done'}, 401)
+    self.api(a, 'PUT', path, {'phase': 'bad'}, 422)
+    self.api(a, 'PUT', path, {'phase': 'working', 'bullets': [{}]}, 422)
+    self.api(a, 'PUT', path, {'phase': 'working', 'bullets': [{}] * 13}, 422)
+    lease = self.claim(a)['lease_id']
+    before = self.app.events.latest_id()
+    ack = f'deliveries/{lease}/delivered'
+    self.api(a, 'POST', ack)
+    self.assertEqual(view()['phase'], 'thinking')
+    result = self.api(a, 'PUT', path, {'phase': 'working', 'summary': 'x' * 280,
+                      'bullets': [{'state': 'active', 'text': 'y' * 210}]})['progress']
+    self.assertEqual(result, view())
+    self.assertEqual((len(result['summary']), len(result['bullets'][0]['text'])), (240, 200))
+    self.api(a, 'POST', ack)
+    self.assertEqual(view()['phase'], 'working')
+    self.api(a, 'POST', f'messages/{mid}/reply', {'body': 'finished'})
+    self.assertIsNone(view())
+    self.assertEqual([e['payload']['phase'] for e in self.app.events.since(before)
+                      if e['type'] == 'message_progress'], ['thinking', 'working', 'done'])
+    for text in ('update one', 'update two'):
+      msg = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': text})['message']
+      self.api(a, 'PUT', f"messages/{msg['id']}/progress", {'phase': 'working'})
+    self.api(a, 'POST', 'messages', {'to': 'owner', 'body': 'both finished'})
+    self.assertIsNone(self.app.message_view(msg['id'])['progress'])
+    late = self.claim(a)
+    self.api(a, 'POST', f"deliveries/{late['lease_id']}/delivered")
+    self.assertIsNone(self.app.message_view(late['message']['id'])['progress'])
+
+  def test_peer_progress_is_isolated_and_ack_preserves_explicit_updates(self):
+    owner = self.owner()
+    a, b, c = (self.agent(owner, h) for h in ('peerask', 'peerwork', 'peerother'))
+    def incoming(sender, body):
+      return self.api(sender, 'POST', 'messages', {'to': b.pid, 'body': body})['message']['id']
+    mid, separate = incoming(a, 'first'), incoming(c, 'independent')
+    def progress(message, phase):
+      return self.api(b, 'PUT', f'messages/{message}/progress', {'phase': phase})['progress']
+    progress(mid, 'working')
+    progress(separate, 'working')
+    lease = self.claim(b)['lease_id']
+    self.api(b, 'POST', f'deliveries/{lease}/delivered')
+    self.assertEqual(self.app.message_view(mid)['progress']['phase'], 'working')
+    self.api(b, 'POST', f'messages/{mid}/reply', {'body': 'answer'})
+    self.assertIsNone(self.app.message_view(mid)['progress'])
+    self.assertEqual(self.app.message_view(separate)['progress']['phase'], 'working')
+    self.assertEqual(progress(separate, 'done')['phase'], 'done')
+    self.assertIsNone(self.app.message_view(separate)['progress'])
+
+  def test_pin_order_and_independent_readers(self):
+    owner = self.owner()
+    a, b = (self.agent(owner, h) for h in ('pinfirst', 'pinlast'))
+    messages = [self.api(agent, 'POST', 'messages', {'to': 'owner', 'body': 'ping'})['message']
+                for agent in (a, b)]
+    first, second = (m['conversation_id'] for m in messages)
+    pin = f'conversations/{first}/pin'
+    at = self.api(owner, 'POST', pin)['pinned_at']
+    self.clock.advance(1)
+    self.api(owner, 'POST', f'conversations/{second}/pin')
+    self.assertEqual(self.api(owner, 'POST', pin)['pinned_at'], at)
+    convs = self.api(owner, 'GET', 'conversations')['conversations']
+    self.assertEqual([c['id'] for c in convs[:2]], [second, first])
+    self.api(owner, 'POST', f'conversations/{first}/read')
+    own = self.api(a, 'GET', 'conversations')['conversations'][0]
+    self.assertEqual(own['last_read_message_id'], 0)
+
+  def test_host_aggregation_avatar_and_pool_metadata(self):
+    o = self.owner()
+    a, b = (self.agent(o, h) for h in ('hosta', 'hostb'))
+    board = lambda: self.api(o, 'GET', 'board')
+    ownerid = board()['owner']['id']
+    self.api(o, 'PATCH', f'admin/principals/{ownerid}', {'avatar': 'sun'})
+    self.assertEqual(board()['owner']['avatar'], 'sun')
+    mates = self.api(a, 'GET', 'teammates')['teammates']
+    self.assertEqual(next(m for m in mates if m['handle'] == 'owner')['avatar'], 'sun')
+    for bad in ({'icon': '<image>'}, {'color': 'url(bad)'}, 'x' * 129):
+      self.api(o, 'PATCH', f'admin/principals/{a.pid}', {'avatar': bad}, 422)
+    metadata = {'os': 'Linux', 'cpu_count': 8, 'arch': 'arm64', 'ip': '127.0.0.1', 'mem_used_pct': 21.1,
+                'uptime_sec': 100, 'mem_used_gb': -1, 'junk': 100}
+    self.checkin(a, host='shared', host_metrics=metadata)
+    before = self.app.events.latest_id()
+    self.checkin(a, host='shared', host_metrics={**metadata, 'mem_used_pct': 22, 'uptime_sec': 115})
+    self.assertEqual(self.app.events.latest_id(), before)
+    self.clock.advance(1)
+    self.checkin(b, host='shared', host_metrics={**metadata, 'mem_used_pct': 35})
+    hosts = {h['host']: h for h in board()['hosts']}
+    host = hosts['shared']
+    self.assertEqual((set(host['agent_ids']), host['online_count'], host['last_seen_at']), ({a.pid, b.pid}, 2, self.clock()))
+    self.assertEqual(host['metrics']['mem_used_pct'], 35)
+    self.assertNotIn('mem_used_gb', host['metrics'])
+    self.assertNotIn('junk', host['metrics'])
+    before = self.app.events.latest_id()
+    self.checkin(b, host='shared', host_metrics={**metadata, 'mem_used_pct': 55})
+    self.assertEqual(self.app.events.since(before)[0]['type'], 'presence')
+    pid = self.api(o, 'POST', 'admin/pools', {'provider': 'vendor', 'label': 'team', 'account_label': 'Office',
+                   'subscription': 'Business', 'notes': 'shared'})['id']
+    self.api(o, 'PATCH', f'admin/principals/{a.pid}', {'pool_id': pid})
+    self.api(o, 'PATCH', f'admin/pools/{pid}', {'reporter_principal_id': a.pid, 'notes': 'new note'})
+    self.checkin(a, usage={'metrics': [{'name': 'weekly', 'used_pct': 10}]})
+    pool = next(p for p in board()['pools'] if p['id'] == pid)
+    usage = self.api(o, 'GET', 'usage')['providers']
+    self.assertEqual(pool, next(p for group in usage for p in group['pools'] if p['id'] == pid))
+    self.assertEqual((pool['reporter']['id'], pool['stale'], pool['account_label'], pool['subscription'], pool['notes']),
+                     (a.pid, False, 'Office', 'Business', 'new note'))
+    self.assertEqual(pool['usage']['metrics'][0]['used_pct'], 10)
+    self.assertEqual(pool['reported_at'], self.clock())
+
+  def test_project_roles_tasks_and_membership(self):
+    o = self.owner()
+    pm, a, b, outside, consul = (self.agent(o, h) for h in ('pmp', 'membera', 'memberb', 'outsidep', 'consulp'))
+    self.api(o, 'POST', 'senate/consul', {'principal_id': consul.pid})
+    payload = {'name': 'Stage One', 'pm_principal_id': pm.pid, 'member_ids': [a.pid, b.pid]}
+    self.api(a, 'POST', 'projects', payload, 403)
+    project = self.api(consul, 'POST', 'projects', payload)['project']
+    pid = project['id']
+    path = f'projects/{pid}'
+    tasks = path + '/tasks'
+    self.assertEqual((project['pm']['id'], project['slug']), (pm.pid, 'stage-one'))
+    self.assertEqual(next(m for m in project['members'] if m['id'] == pm.pid)['project_role'], 'pm')
+    self.api(o, 'POST', 'projects', payload, 409)
+    self.api(outside, 'PATCH', path, {'name': 'no'}, 403)
+    self.api(pm, 'PATCH', path, {'status': 'invalid'}, 422)
+    self.api(pm, 'PATCH', path, {'status': 'paused', 'description': 'review'})
+    self.api(consul, 'PATCH', path, {'status': 'active'})
+    self.api(a, 'PATCH', path, {'name': 'no'}, 403)
+    self.api(outside, 'POST', tasks, {'title': 'no', 'assignee_ids': [a.pid]}, 403)
+    for ids in ([], [outside.pid], ['2']):
+      self.assertEqual(self.api(pm, 'POST', tasks, {'title': 'bad', 'assignee_ids': ids}, 422)['error'], 'bad_assignees')
+    t = self.api(a, 'POST', tasks, {'title': 'Write', 'assignee_ids': [b.pid], 'priority': 2})['task']
+    task = f"tasks/{t['id']}"
+    self.api(a, 'PATCH', task, {'title': 'no'}, 403)
+    self.api(outside, 'PATCH', task, {'status': 'done'}, 403)
+    self.api(b, 'PATCH', task, {'status': 'blocked'})
+    for data in ({'assignee_ids': []}, {'assignee_ids': [outside.pid]}, {'status': 'unknown'}, {'priority': True}):
+      self.api(pm, 'PATCH', task, data, 422)
+    fail = self.api(pm, 'PATCH', path, {'name': 'rolled back', 'member_ids': [a.pid]}, 409)
+    self.assertEqual(fail['error'], 'member_has_sole_task')
+    self.api(consul, 'PATCH', task, {'assignee_ids': [a.pid, b.pid]})
+    self.api(o, 'PATCH', path, {'member_ids': []}, 409)
+    revised = self.api(pm, 'PATCH', path, {'member_ids': [a.pid]})['project']
+    self.assertEqual(revised['name'], 'Stage One')
+    self.assertEqual([p['id'] for p in revised['tasks'][0]['assignees']], [a.pid])
+    self.api(a, 'PATCH', task, {'status': 'done', 'title': 'Written'})
+    self.api(o, 'PATCH', path, {'pm_principal_id': b.pid, 'member_ids': []})
+    self.api(pm, 'PATCH', path, {'name': 'former manager'}, 403)
+    self.api(b, 'PATCH', task, {'status': 'open'}, 422)
+    self.api(b, 'PATCH', task, {'status': 'open', 'assignee_ids': [b.pid]})
+    view = next(p for p in self.api(outside, 'GET', 'projects')['projects'] if p['id'] == pid)
+    self.assertEqual(view['pm']['id'], b.pid)
+    self.assertEqual(view, next(p for p in self.api(o, 'GET', 'board')['projects'] if p['id'] == pid))
+
+  def test_vendor_files_and_invalid_names(self):
+    for name, mime in [('katex.min.css', 'text/css'), ('fonts/KaTeX_Main-Regular.woff2', 'font/woff2')]:
+      with urllib.request.urlopen(self.base + '/static/vendor/katex/' + name) as response:
+        self.assertEqual(response.headers.get_content_type(), mime)
+        self.assertEqual(response.read(), (ROOT / 'lyra_server/static/vendor/katex' / name).read_bytes())
+    for name in ('', '/app.js', 'vendor//katex', '.private', 'vendor/%2e%2e/app.js', 'vendor%5ckatex'):
+      with self.assertRaises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(self.base + '/static/' + name)
+      self.assertEqual(caught.exception.code, 404)
+
+  def test_v4_backup_and_restore(self):
+    o = self.owner()
+    a = self.agent(o, 'snapshot')
+    m = self.api(o, 'POST', 'messages', {'body': 'snapshot', 'to': a.pid})['message']
+    self.api(a, 'POST', f"conversations/{m['conversation_id']}/read")
+    self.api(a, 'PUT', f"messages/{m['id']}/progress", {'phase': 'working', 'summary': 'saved'})
+    proj = self.api(o, 'POST', 'projects', {'name': 'Snapshot', 'member_ids': [a.pid]})['project']
+    self.api(a, 'POST', f"projects/{proj['id']}/tasks", {'title': 'back up', 'assignee_ids': [a.pid]})
+    with tempfile.TemporaryDirectory() as d:
+      snap, restored = Path(d) / 'backup.sqlite', Path(d) / 'restore' / 'lyra.sqlite'
+      rows = backup.backup(self.settings.db_path, out=snap)['rows']
+      self.assertEqual(backup.restore(snap, restored)['rows'], rows)
+      for table in ('conversation_reads', 'message_progress', 'projects', 'project_members', 'tasks', 'task_assignees'):
+        self.assertGreater(rows[table], 0, table)
+      conn = sqlite3.connect(str(restored))
+      try:
+        self.assertEqual(conn.execute('SELECT summary FROM message_progress WHERE message_id=?', (m['id'],)).fetchone()[0], 'saved')
+      finally:
+        conn.close()
+
+
 class DeliveryTests(ServerCase):
 
   def test_jump_goes_first_and_queue_only_rejects_jump(self):
@@ -901,37 +1134,19 @@ class SenateAndConsulTests(ServerCase):
     self.assertEqual(a.call('POST', '/api/v1/consul/invites',
                             {'handle': 'x1', 'reason': 'after dismissal'})[0], 403)
 
-  def test_schema_v2_to_v3_preserves_presence_and_messages(self):
-    from lyra_server.db import Database
-    with tempfile.TemporaryDirectory() as d:
-      path = Path(d) / 'v2.sqlite'
-      conn = sqlite3.connect(str(path))
-      conn.executescript("""
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
-        INSERT INTO meta VALUES ('schema_version','2');
-        CREATE TABLE presence (principal_id INTEGER PRIMARY KEY, instance_id TEXT, host TEXT,
-          provider TEXT, runtime TEXT, connector TEXT, modes TEXT, status TEXT, last_checkin_at REAL,
-          online INTEGER NOT NULL DEFAULT 0);
-        INSERT INTO presence(principal_id, host, online) VALUES(8, 'original', 1);
-        CREATE TABLE messages (id INTEGER PRIMARY KEY, recipient_id INTEGER, state TEXT, priority INTEGER,
-          created_at REAL, conversation_id INTEGER, body TEXT);
-        INSERT INTO messages VALUES (12, 8, 'delivered', 1, 2, 7, 'original message');
-      """)
-      conn.close()
-      db = Database(path)
-      try:
-        self.assertEqual(tuple(db.one('SELECT host, capabilities FROM presence')), ('original', None))
-        self.assertEqual(db.one('SELECT body FROM messages WHERE id=12')[0], 'original message')
-        self.assertEqual(db._version(), 3)
-        self.assertEqual(db.all('SELECT * FROM attachments'), [])
-        self.assertTrue(db.one("SELECT 1 FROM sqlite_master WHERE name='ix_message_attachments_msg'"))
-      finally:
-        db.close()
+  def test_schema_v1_to_v4(self):
+    self.check_migration(1)
 
-  def test_schema_v1_to_v3_migration_preserves_existing_data(self):
+  def test_schema_v2_to_v4(self):
+    self.check_migration(2)
+
+  def test_schema_v3_to_v4(self):
+    self.check_migration(3)
+
+  def check_migration(self, version):
     from lyra_server.db import Database, SCHEMA_VERSION
     d = tmpdir()
-    db_path = Path(d) / 'v1.sqlite'
+    db_path = Path(d) / f'v{version}.sqlite'
     conn = sqlite3.connect(str(db_path))
     conn.executescript("""
       CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
@@ -978,16 +1193,51 @@ class SenateAndConsulTests(ServerCase):
         VALUES (1, 'owner', 'owner', 'William', 'admitted', 1.0, 1.0),
                (2, 'agent', 'gem', 'Gem', 'admitted', 1.0, 1.0);
     """)
+    conn.executescript("""
+      INSERT INTO presence(principal_id, host, online) VALUES (2, 'original', 1);
+      INSERT INTO conversations VALUES (7, 'owner_agent', '1:2', 1.0);
+      INSERT INTO messages(id, conversation_id, sender_id, recipient_id, body, mode, priority, state, created_at)
+        VALUES (12, 7, 1, 2, 'original message', 'queue', 0, 'delivered', 2.0);
+    """)
+    if version >= 2:
+      conn.executescript("""
+        ALTER TABLE principals ADD COLUMN role TEXT;
+        CREATE UNIQUE INDEX uq_principal_consul ON principals(role) WHERE role='consul';
+        ALTER TABLE invites ADD COLUMN issued_by_principal_id INTEGER;
+        ALTER TABLE invites ADD COLUMN reason TEXT;
+      """)
+    if version == 3:
+      conn.executescript("""
+        ALTER TABLE presence ADD COLUMN capabilities TEXT;
+        UPDATE presence SET capabilities='{"images":true}';
+        CREATE TABLE attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, uploader_id INTEGER NOT NULL,
+          sha256 TEXT NOT NULL, mime_type TEXT NOT NULL, filename TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+          storage_relpath TEXT NOT NULL UNIQUE, created_at REAL NOT NULL);
+        CREATE TABLE message_attachments (message_id INTEGER NOT NULL, attachment_id INTEGER NOT NULL UNIQUE,
+          position INTEGER NOT NULL, PRIMARY KEY(message_id,attachment_id));
+        INSERT INTO attachments VALUES (9,1,'digest','image/png','a.png',12,'aa/image.png',1);
+        INSERT INTO message_attachments VALUES(12,9,0);
+      """)
+    conn.execute("UPDATE meta SET value=? WHERE key='schema_version'", (str(version),))
     conn.commit()
     conn.close()
 
     db = Database(db_path)
     try:
       ver = db.one("SELECT value FROM meta WHERE key='schema_version'")[0]
-      self.assertEqual(int(ver), 3)
-      self.assertEqual(SCHEMA_VERSION, 3)
+      self.assertEqual(int(ver), 4)
+      self.assertEqual(SCHEMA_VERSION, 4)
       self.assertIn('capabilities', [r['name'] for r in db.all('PRAGMA table_info(presence)')])
-      self.assertEqual(db.all('SELECT * FROM message_attachments'), [])
+      self.assertEqual(db.one('SELECT host FROM presence')[0], 'original')
+      self.assertEqual(db.one('SELECT body FROM messages WHERE id=12')[0], 'original message')
+      self.assertEqual(tuple(db.one('SELECT pinned,pinned_at FROM conversations')), (0, None))
+      for table in ('conversation_reads', 'message_progress', 'projects', 'project_members', 'tasks', 'task_assignees'):
+        self.assertEqual(db.all(f'SELECT * FROM {table}'), [])
+      if version == 3:
+        self.assertEqual(tuple(db.one('SELECT * FROM message_attachments')), (12, 9, 0))
+        self.assertTrue(json.loads(db.one('SELECT capabilities FROM presence')[0])['images'])
+      else:
+        self.assertEqual(db.all('SELECT * FROM message_attachments'), [])
       gem = db.one("SELECT handle, role FROM principals WHERE id=2")
       self.assertEqual((gem['handle'], gem['role']), ('gem', None))
       with db.tx() as c:

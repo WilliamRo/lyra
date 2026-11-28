@@ -23,7 +23,7 @@ if CONNECTOR.is_dir():
 from test_server import ServerCase  # noqa: E402
 
 try:
-  from lyralib import echo, link, store, stream  # noqa: E402
+  from lyralib import daemon, echo, link, store, stream  # noqa: E402
   from lyralib.client import Client  # noqa: E402
 except ImportError:  # connector not present next to this checkout
   link = None
@@ -38,6 +38,26 @@ class ConnectorRoundTrip(ServerCase):
 
   def tearDown(self):
     os.environ.pop('LYRA_LINK_STATE_DIR', None)
+
+  def test_checkin_progress_and_reply_through_connector(self):
+    owner = self.owner()
+    registered = self.agent(owner, 'staged', checkin=False)
+    agent = Client(self.base, registered.token)
+    payload = daemon.checkin_payload('staged', {}, os.getpid())
+    agent.checkin(payload)
+    host = next(h for h in owner.call('GET', '/api/v1/board')[1]['hosts'] if registered.pid in h['agent_ids'])
+    self.assertEqual(host['metrics']['os'], payload['host_metrics']['os'])
+    mid = owner.call('POST', '/api/v1/messages', {'to': registered.pid, 'body': 'Review'})[1]['message']['id']
+    got = agent.claim(wait=0)
+    agent.ack(got['lease_id'], 'delivered')
+    bullets = [{'state': 'active', 'text': 'Reviewing the result'}]
+    agent.progress(mid, 'working', 'Running tests', bullets)
+    def latest():
+      return owner.call('GET', f"/api/v1/conversations/{got['message']['conversation_id']}/messages")[1]['messages']
+    self.assertEqual(latest()[0]['progress']['bullets'], bullets)
+    agent.reply(mid, 'Tests passed.')
+    self.assertIsNone(latest()[0]['progress'])
+    self.assertEqual(latest()[1]['reply_to']['id'], mid)
 
   def test_owner_image_to_connector_and_image_reply(self):
     owner = self.owner()
