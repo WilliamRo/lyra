@@ -142,8 +142,7 @@
     while (el.firstChild) el.removeChild(el.firstChild);
     el.className = 'receipt is-' + info.kind + ' tone-' + info.tone;
     el.setAttribute('data-kind', info.kind);
-    var status = node(doc, 'span', 'rc-status');
-    status.setAttribute('role', 'status');
+    var status = node(doc, 'span', 'rc-status');      // historical receipts are not live regions
     if (info.kind === 'sending') status.appendChild(node(doc, 'span', 'rc-spinner'));
     else if (info.checks) status.appendChild(checks(doc, info.checks));
     status.appendChild(node(doc, 'span', 'rc-label', info.label));

@@ -92,9 +92,11 @@
     var el = svg(doc, '0 0 32 32', size || 28);
     el.setAttribute('class', 'lyra-logo');
     var tile = doc.createElementNS(SVG_NS, 'rect');
-    tile.setAttribute('x', '0'); tile.setAttribute('y', '0');
-    tile.setAttribute('width', '32'); tile.setAttribute('height', '32'); tile.setAttribute('rx', '8');
-    tile.setAttribute('fill', '#18191c');
+    tile.setAttribute('x', '.5'); tile.setAttribute('y', '.5');
+    tile.setAttribute('width', '31'); tile.setAttribute('height', '31'); tile.setAttribute('rx', '7.5');
+    tile.setAttribute('fill', '#121316');
+    tile.setAttribute('stroke', 'rgba(250, 204, 21, .28)');   // a faint gold rim separates it from dark bars
+    tile.setAttribute('stroke-width', '1');
     el.appendChild(tile);
     var stroke = { fill: 'none', stroke: GOLD, 'stroke-width': '1.4', 'stroke-linecap': 'round',
                    'stroke-linejoin': 'round', 'stroke-opacity': '.7' };
@@ -114,11 +116,21 @@
     catch (_e) { return 'light'; }
   }
 
+  var THEME_COLORS = { light: '#eef0f3', dark: '#18191c' };   // the topbar color of each theme
+
   function applyTheme(theme) {
-    var html = root.document && root.document.documentElement;
+    var doc = root.document;
+    var html = doc && doc.documentElement;
     var t = theme === 'dark' || theme === 'light' ? theme : null;
     if (html) {
       if (t) html.setAttribute('data-theme', t); else html.removeAttribute('data-theme');
+      // Browser chrome follows the board: a pinned theme colors both meta tags, none restores the defaults.
+      var metas = doc.querySelectorAll('meta[name="theme-color"]');
+      for (var i = 0; i < metas.length; i++) {
+        var media = metas[i].getAttribute('media') || '';
+        var natural = media.indexOf('dark') !== -1 ? 'dark' : 'light';
+        metas[i].setAttribute('content', THEME_COLORS[t || natural]);
+      }
     }
     return t || systemTheme();
   }
@@ -140,6 +152,7 @@
     provider: provider,
     providerName: providerName,
     applyTheme: applyTheme,
+    THEME_COLORS: THEME_COLORS,
     systemTheme: systemTheme,
     storedTheme: storedTheme,
   };

@@ -40,7 +40,8 @@ const S = {
   sending: false, staged: [], navigation: 0, optimistic: [], readInFlight: {},
   pending: { board: false, convs: false, conv: false, timer: null }, receiptNodes: new Map(),
   qs: { items: [], all: [], sel: 0 }, needs: [], needsKeys: null, failed: new Map(), notifyConvs: new Set(),
-  audio: null, menuHost: null,
+  audio: null, menuHost: null, seenEventId: null,
+  resync: { pending: false, inflight: false, again: false, attempt: 0, timer: null, latest: null },
 };
 
 // =============================================================================
@@ -199,14 +200,23 @@ function avatar(p, size, opts) {
 // API and session
 // =============================================================================
 
-async function api(method, path, body, headers = {}) {
+// extra: { signal } to cancel, or { timeoutMs } to bound a request that might stall.
+async function api(method, path, body, headers = {}, extra = {}) {
   const opts = { method, credentials: 'same-origin', headers };
   if (body instanceof File) opts.body = body;
   else if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opts);
+  let timer = null;
+  if (extra.signal) opts.signal = extra.signal;
+  else if (extra.timeoutMs) {
+    const ac = new AbortController();
+    opts.signal = ac.signal;
+    timer = setTimeout(() => ac.abort(), extra.timeoutMs);
+  }
+  let res;
+  try { res = await fetch(path, opts); } finally { clearTimeout(timer); }
   let data = {};
   try { data = await res.json(); } catch (_e) { data = {}; }
   if (res.status === 401 && path !== '/api/v1/auth/login') showLogin();
@@ -345,6 +355,9 @@ mqWide.addEventListener('change', () => { renderTabs(); maybeMarkRead(); });
 
 // --- collapsible and resizable sidebar ---------------------------------------
 
+// The sidebar never takes more than 42% of the window (CSS clamps with min(var, 42vw) as well).
+function sidebarMax() { return Math.max(SIDEBAR.min, Math.min(SIDEBAR.max, Math.floor(window.innerWidth * 0.42))); }
+
 function applySidebar() {
   const collapsed = !!S.view.sidebarCollapsed;
   $('layout').classList.toggle('sidebar-collapsed', collapsed);
@@ -352,21 +365,27 @@ function applySidebar() {
   const t = $('sidebar-toggle');
   t.setAttribute('aria-expanded', String(!collapsed));
   t.title = collapsed ? 'Show agents sidebar (H)' : 'Hide agents sidebar (H)';
-  $('sidebar-resizer').setAttribute('aria-valuenow', String(S.view.sidebarWidth));
+  const r = $('sidebar-resizer');
+  r.setAttribute('aria-valuemax', String(sidebarMax()));
+  r.setAttribute('aria-valuenow', String(Math.min(S.view.sidebarWidth, sidebarMax())));
 }
 
 function toggleSidebar() {
   if (!mqDesktop.matches) { setTab(currentTab() === 'agents' ? 'chats' : 'agents'); return; }
-  S.view.sidebarCollapsed = !S.view.sidebarCollapsed;
+  const collapsing = !S.view.sidebarCollapsed;
+  if (collapsing && $('pane-agents').contains(document.activeElement)) $('sidebar-toggle').focus();
+  S.view.sidebarCollapsed = collapsing;
   saveView();
   applySidebar();
 }
 
 function setSidebarWidth(w, persist) {
-  S.view.sidebarWidth = Math.max(SIDEBAR.min, Math.min(SIDEBAR.max, Math.round(w)));
+  S.view.sidebarWidth = Math.max(SIDEBAR.min, Math.min(sidebarMax(), Math.round(w)));
   applySidebar();
   if (persist) saveView();
 }
+
+window.addEventListener('resize', () => { if (S.view) applySidebar(); });
 
 $('sidebar-toggle').addEventListener('click', toggleSidebar);
 (function wireResizer() {
@@ -400,7 +419,7 @@ $('sidebar-toggle').addEventListener('click', toggleSidebar);
     const keys = { ArrowLeft: -step, ArrowRight: step };
     if (keys[ev.key]) { ev.preventDefault(); setSidebarWidth(S.view.sidebarWidth + keys[ev.key], true); }
     else if (ev.key === 'Home') { ev.preventDefault(); setSidebarWidth(SIDEBAR.min, true); }
-    else if (ev.key === 'End') { ev.preventDefault(); setSidebarWidth(SIDEBAR.max, true); }
+    else if (ev.key === 'End') { ev.preventDefault(); setSidebarWidth(sidebarMax(), true); }
   });
 })();
 
@@ -409,10 +428,12 @@ $('sidebar-toggle').addEventListener('click', toggleSidebar);
 // =============================================================================
 
 async function refreshAll(initial) {
-  const [board, convs] = await Promise.all([api('GET', '/api/v1/board'), api('GET', '/api/v1/conversations')]);
+  // Board first: its last_event_id is the SSE cursor, so everything after it replays on connect.
+  // Conversations are read after that cursor, never before it, so no message can slip between them.
+  const board = await api('GET', '/api/v1/board');
+  const convs = await api('GET', '/api/v1/conversations');
   S.board = board;
   S.convs = convs.conversations || [];
-  // Seed the SSE cursor from the snapshot so no event between load and connect is missed.
   if (S.lastEventId == null && board.last_event_id != null) S.lastEventId = String(board.last_event_id);
   if (initial || !S.view) { loadView(); applyTheme(); applySidebar(); renderNotifyToggle(); }
   renderTabs();
@@ -455,7 +476,12 @@ async function runRefresh() {
       S.board = board;
       renderAgents(); renderProjects(); renderSenate();
     }
-    if (convs) { S.convs = convs.conversations || []; renderConvList(); notifyNewMessages(); }
+    if (convs) {
+      S.convs = convs.conversations || [];
+      renderConvList();
+      notifyNewMessages();
+      if (S.board && !board) renderAgents();      // agent rows show unread counts
+    }
     if (board || convs) renderTitle();
     if ((want.conv || board) && S.conv && S.conv.id) await reloadConv();
     else if (board && S.conv) { renderThreadHeader(); renderComposer(); }
@@ -487,11 +513,12 @@ function connectEvents() {
     setConn(true);
     if (recovered) {
       showBanner('Back online. Refreshing…', true);
-      setTimeout(() => { if (S.conn.up) $('conn-banner').hidden = true; }, 2000);
-      refreshAll(false).catch(() => {});
+      startResync(null);
+    } else if (!S.resync.pending) {
+      $('conn-banner').hidden = true;
     }
   };
-  es.onerror = () => dropConnection(es);
+  es.onerror = () => dropConnection(es);      // also covers failures before the stream ever opened
   for (const t of EVENT_TYPES) es.addEventListener(t, (ev) => onEvent(t, ev));
 }
 
@@ -500,8 +527,40 @@ function dropConnection(es) {
   if (!es || S.es === es) S.es = null;
   S.conn.wasDown = true;
   setConn(false);
-  // A 401 shows the sign-in card (api() handles it); anything else keeps retrying.
-  api('GET', '/api/v1/auth/me').then(() => planReconnect(), (e) => { if (e.status !== 401) planReconnect(); });
+  planReconnect();          // the banner shows now and the retry is scheduled no matter what follows
+  // A bounded session check runs alongside: a 401 shows the sign-in card (api() handles it and
+  // stops the retries); a stalled or failed check is simply abandoned.
+  api('GET', '/api/v1/auth/me', undefined, {}, { timeoutMs: 5000 }).catch(() => {});
+}
+
+// Reload the board after a reset or a reconnect. The cursor only moves once the reload worked;
+// failures retry with backoff behind the banner.
+async function startResync(latest) {
+  const r = S.resync;
+  if (latest != null) r.latest = String(latest);
+  r.pending = true;
+  if (r.inflight) { r.again = true; return; }
+  clearTimeout(r.timer);
+  r.inflight = true;
+  try {
+    await refreshAll(false);
+    r.inflight = false;
+    if (r.again) { r.again = false; startResync(null); return; }
+    r.pending = false;
+    r.attempt = 0;
+    S.lastEventId = S.seenEventId || r.latest || S.lastEventId;
+    if (S.conn.up) {
+      showBanner('Back online.', true);
+      setTimeout(() => { if (S.conn.up && !S.resync.pending) $('conn-banner').hidden = true; }, 1500);
+    }
+  } catch (_e) {
+    r.inflight = false;
+    r.again = false;
+    r.attempt += 1;
+    const delay = Math.min(30, Math.pow(2, r.attempt)) * (0.5 + Math.random() * 0.5);
+    showBanner(`Could not reload the board. Resyncing in ${Math.max(1, Math.round(delay))} s…`, false);
+    r.timer = setTimeout(() => startResync(null), delay * 1000);
+  }
 }
 
 // Health watchdog: a silent stream (no tick or event for 30 s) is treated as dead.
@@ -511,13 +570,15 @@ setInterval(() => {
 
 function onEvent(type, ev) {
   S.conn.lastBeat = Date.now();
-  if (ev.lastEventId) S.lastEventId = ev.lastEventId;
+  if (ev.lastEventId) {
+    S.seenEventId = ev.lastEventId;
+    if (!S.resync.pending) S.lastEventId = ev.lastEventId;    // held back until a pending reload succeeds
+  }
   if (type === 'tick') return;
   let d = {};
   try { d = JSON.parse(ev.data); } catch (_e) { d = {}; }
   if (type === 'reset') {           // our cursor is outside the server's window: reload everything
-    if (d.latest_id != null) S.lastEventId = String(d.latest_id);
-    refreshAll(false).catch(() => {});
+    startResync(d.latest_id);
     return;
   }
   const inConv = S.conv && S.conv.id != null && d.conversation_id === S.conv.id;
@@ -539,7 +600,7 @@ function onEvent(type, ev) {
 function setConn(up, text) {
   S.conn.up = up;
   const live = $('live');
-  live.textContent = up ? 'live' : 'offline';
+  live.querySelector('.live-text').textContent = up ? 'live' : 'offline';
   live.classList.toggle('on', up);
   live.classList.toggle('off', !up);
   if (text) showBanner(text, false);
@@ -569,7 +630,11 @@ function planReconnect() {
   S.conn.timer = setTimeout(() => { clearInterval(S.conn.tick); connectEvents(); }, delay * 1000);
 }
 
-$('conn-retry').addEventListener('click', () => { S.conn.attempt = 0; connectEvents(); });
+$('conn-retry').addEventListener('click', () => {
+  if (S.resync.pending && S.conn.up) { S.resync.attempt = 0; startResync(null); return; }
+  S.conn.attempt = 0;
+  connectEvents();
+});
 
 // =============================================================================
 // Notifications: hidden-tab desktop notices, a soft chime, per-agent mute
@@ -884,7 +949,10 @@ function renderByMachine(root, admitted) {
       'aria-controls': detailsId, 'data-host': host.host, 'aria-haspopup': 'menu',
       title: aliased ? `${name} (${host.host}). Right-click to rename.` : `${host.host}. Right-click to rename.`,
       onclick: () => { toggleIn(S.view.expandedMachineIds, host.host); renderAgents(); },
-      oncontextmenu: (ev) => openHostMenu(ev, host) },
+      oncontextmenu: (ev) => openHostMenu(ev, host),
+      onkeydown: (ev) => {
+        if (ev.key === 'ContextMenu' || (ev.shiftKey && ev.key === 'F10')) openHostMenu(ev, host);
+      } },
       h('span', { class: 'rail-name', text: aliased ? name : name.replace(/\.local$/, '') }),
       h('span', { class: 'rail-sub', text: `${host.online_count} of ${agents.length} online` }),
       m.os ? h('span', { class: 'rail-sub', text: [m.os, m.arch].filter(Boolean).join(' ') }) : null,
@@ -991,8 +1059,14 @@ function poolGroup(pool, agents) {
   const rem = poolRemaining(pool);
   const detailsId = 'pool-details-' + pool.id;
   // Show each distinct piece of metadata once: account and subscription often repeat the label.
-  const seen = new Set([norm(pool.label)]);
-  const distinct = (v) => { const k = norm(v); if (!k || seen.has(k)) return null; seen.add(k); return v; };
+  const seen = [norm(pool.label)];
+  const phrase = (hay, needle) => (' ' + hay + ' ').includes(' ' + needle + ' ');
+  const distinct = (v) => {
+    const k = norm(v);
+    if (!k || seen.some((x) => x === k || phrase(x, k))) return null;   // also "Ultra" inside "Google AI Ultra"
+    seen.push(k);
+    return v;
+  };
   const account = distinct(pool.account_label);
   const plan = distinct(pool.subscription);
   const card = h('button', { type: 'button', class: 'rail-card pool-card', 'aria-expanded': String(expanded), 'aria-controls': detailsId,
@@ -1042,7 +1116,8 @@ function renderQuotaAlert() {
       if (!S.view.expandedPoolIds.includes(first.p.id)) S.view.expandedPoolIds.push(first.p.id);
       const k = MOD.brand ? MOD.brand.key(first.p.provider) : String(first.p.provider).toLowerCase();
       S.view.expandedProviderIds = S.view.expandedProviderIds.filter((x) => x !== k);
-      saveView(); renderAgents(); setTab('agents');
+      saveView(); renderAgents();
+      if (!mqDesktop.matches) setTab('agents');      // on desktop the sidebar is already visible
       const el = document.querySelector(`[data-pool-id="${first.p.id}"]`);
       if (el) el.scrollIntoView({ block: 'nearest' });
     } }, 'Show pool'));
@@ -1108,7 +1183,11 @@ function renderAgents() {
   const agents = S.board.agents || [];
   const admitted = agents.filter((a) => a.status === 'admitted');
   $('agents-count').textContent = `${admitted.filter((a) => a.presence.online).length}/${admitted.length} online`;
-  document.querySelectorAll('.seg-btn').forEach((b) => b.setAttribute('aria-checked', String(b.dataset.group === S.view.agentGroupMode)));
+  document.querySelectorAll('.seg-btn').forEach((b) => {
+    const on = b.dataset.group === S.view.agentGroupMode;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on ? 0 : -1;                       // roving tabindex: one stop for the group
+  });
   renderQuotaAlert();
   S.needs = computeNeeds();
   notifyNeeds(S.needs);
@@ -1136,7 +1215,7 @@ document.querySelectorAll('.seg-btn').forEach((b) => b.addEventListener('click',
   renderAgents();
 }));
 document.querySelector('.seg').addEventListener('keydown', (ev) => {
-  if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+  if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(ev.key)) return;
   ev.preventDefault();
   S.view.agentGroupMode = S.view.agentGroupMode === 'machine' ? 'provider' : 'machine';
   saveView();
@@ -1181,8 +1260,9 @@ function openHostMenu(ev, host) {
   menu.querySelector('[data-act="clear"]').hidden = !(host.display_name && host.display_name !== host.host);
   menu.hidden = false;
   const r = ev.currentTarget.getBoundingClientRect();
-  const x = ev.clientX || r.left + 12;
-  const y = ev.clientY || r.top + 12;
+  const fromKeys = ev.type === 'keydown' || !ev.clientX;     // keyboard: anchor to the card, not the pointer
+  const x = fromKeys ? r.left + 12 : ev.clientX;
+  const y = fromKeys ? r.top + 24 : ev.clientY;
   const w = menu.offsetWidth; const hgt = menu.offsetHeight;
   menu.style.left = Math.max(8, Math.min(x, window.innerWidth - w - 8)) + 'px';
   menu.style.top = Math.max(8, Math.min(y, window.innerHeight - hgt - 8)) + 'px';
@@ -1395,6 +1475,8 @@ async function openConv(id, opts) {
     saveView();
     restoreDraft();
   }
+  // Tapping the same conversation again after going back must reopen it on phones.
+  if (o.user && !mqWide.matches && S.view.mobileChatView !== 'thread') { S.view.mobileChatView = 'thread'; saveView(); }
   if (o.user) setTab('chats');
   renderTabs();
   renderConvList();
@@ -1566,7 +1648,7 @@ function liveNode(m, ctx) {
 function thumb(image, opts) {
   const url = '/api/v1/attachments/' + Number(image.id);
   const img = h('img', { alt: image.filename || 'Image', loading: 'lazy', width: 120, height: 72 });
-  if (opts && opts.onError) img.addEventListener('error', opts.onError, { once: true });
+  if (opts && opts.onError) img.addEventListener('error', () => opts.onError(img), { once: true });
   img.src = url;
   if (MOD.pop) MOD.pop.enhance(img);
   return img;
@@ -1654,14 +1736,35 @@ const DURATIONS = [['client_to_server', 'Browser to server'], ['server_to_claim'
   ['claim_to_agent_read', 'Claim to agent read'], ['agent_think_to_reply', 'Agent think to reply'],
   ['total_round_trip', 'Total round trip']];
 
+// Only the newest request may render: closing the dialog or opening another message cancels the rest.
+let detailsSeq = 0;
+let detailsAbort = null;
+function cancelDetails() {
+  detailsSeq += 1;
+  if (detailsAbort) { detailsAbort.abort(); detailsAbort = null; }
+}
+// The close event is queued: if another message reopened the dialog meanwhile, keep that request.
+$('lifecycle-dialog').addEventListener('close', () => { if (!$('lifecycle-dialog').open) cancelDetails(); });
+
 async function showDetails(m) {
+  cancelDetails();
+  const seq = detailsSeq;
+  const ac = new AbortController();
+  detailsAbort = ac;
   const body = clear($('lifecycle-body'));
+  body.dataset.messageId = String(m.id);
   body.append(h('p', { class: 'muted', text: 'Loading…' }));
   $('lifecycle-title').textContent = 'Delivery details';
   if (!$('lifecycle-dialog').open) $('lifecycle-dialog').showModal();
   let r;
-  try { r = await api('GET', `/api/v1/messages/${m.id}/lifecycle`); }
-  catch (e) { clear(body).append(h('p', { class: 'error', text: e.message })); return; }
+  try { r = await api('GET', `/api/v1/messages/${m.id}/lifecycle`, undefined, {}, { signal: ac.signal }); }
+  catch (e) {
+    if (seq !== detailsSeq || e.name === 'AbortError') return;
+    clear(body).append(h('p', { class: 'error', text: e.message }));
+    return;
+  }
+  if (seq !== detailsSeq || !$('lifecycle-dialog').open) return;
+  detailsAbort = null;
   clear(body);
   const stateCls = { delivered: 'ok', failed: 'bad', cancelled: '', unconfirmed: 'warn', waiting: 'info' }[r.state] || '';
   body.append(h('div', { class: 'storage-head' },
@@ -1711,16 +1814,39 @@ function restoreDraft() {
   S.replyTo = null;
   if (d && d.replyToId) S.replyTo = { id: d.replyToId, pending: true };
   S.draftMode = d ? d.mode : null;
-  S.staged = d ? d.attachments.map((a) => ({ name: a.filename, image: a, restored: true })) : [];
+  S.staged = d ? d.attachments.map((a) => ({ name: a.filename, image: a, restored: true, draftKey: key, token: clientId() })) : [];
   $('draft-hint').textContent = d && (d.text || d.attachments.length) ? 'Draft restored' : '';
   autoGrow();
+}
+
+function attachmentMeta(img, name) {
+  return { id: img.id, filename: img.filename || name, mime_type: img.mime_type, size_bytes: img.size_bytes };
+}
+
+// An upload that finishes after the owner switched chats still lands in the draft it started in.
+function addToStoredDraft(key, item) {
+  if (!store || !key || item.removed) return;
+  const d = store.drafts.load(key) || { text: '', replyToId: null, mode: 'queue', attachments: [] };
+  if (!d.attachments.some((a) => a.id === item.image.id)) d.attachments.push(attachmentMeta(item.image, item.name));
+  store.drafts.save(key, d);
+  if (draftKey() === key && !S.staged.some((x) => x.image && x.image.id === item.image.id)) {
+    S.staged.push(Object.assign(item, { restored: true }));      // back on that chat already
+    renderImages();
+  }
+}
+
+function removeFromStoredDraft(key, id) {
+  if (!store || !key) return;
+  const d = store.drafts.load(key);
+  if (!d) return;
+  d.attachments = d.attachments.filter((a) => a.id !== id);
+  store.drafts.save(key, d);
 }
 
 function saveDraft() {
   const key = draftKey();
   if (!key || !store) return;
-  const attachments = S.staged.filter((i) => i.image).map((i) => ({ id: i.image.id, filename: i.image.filename || i.name,
-    mime_type: i.image.mime_type, size_bytes: i.image.size_bytes }));
+  const attachments = S.staged.filter((i) => i.image).map((i) => attachmentMeta(i.image, i.name));
   store.drafts.save(key, { text: $('compose-body').value, replyToId: S.replyTo ? S.replyTo.id : null,
     mode: $('compose-mode').value || 'queue', attachments });
   $('draft-hint').textContent = $('compose-body').value || attachments.length ? 'Draft saved' : '';
@@ -1776,29 +1902,65 @@ function setAttachTip(text) {
   $('compose-attach').setAttribute('aria-label', text);
 }
 
+// A restored image that fails to load is only dropped when the server says it is gone (404 or
+// 410); network errors and 5xx keep it in the draft with a retry.
+async function attachmentStatus(id) {
+  try {
+    const r = await fetch('/api/v1/attachments/' + Number(id), { credentials: 'same-origin', cache: 'no-store' });
+    return r.status;
+  } catch (_e) { return 0; }
+}
+
+async function onDraftImageError(item, img) {
+  // Ignore thumbnails a re-render already replaced, and check each item once at a time.
+  if ((img && !img.isConnected) || item.checking || item.removed) return;
+  item.checking = true;
+  const status = await attachmentStatus(item.image.id);
+  item.checking = false;
+  if (status === 404 || status === 410) {
+    item.removed = true;
+    const i = S.staged.indexOf(item);
+    if (i !== -1) S.staged.splice(i, 1);
+    removeFromStoredDraft(item.draftKey, item.image.id);
+    if (draftKey() === item.draftKey) {
+      renderImages();
+      $('compose-error').textContent = `${item.name} is no longer on the server and was removed from the draft.`;
+    }
+    return;
+  }
+  item.broken = true;
+  if (S.staged.includes(item)) renderImages();
+}
+
 function renderImages() {
   const agent = recipientAgent();
   const allowed = supportsImages(agent);
   const note = $('compose-image-note');
   const attach = $('compose-attach');
-  attach.disabled = !allowed || S.sending;
+  // aria-disabled keeps the control focusable, so keyboard and touch users still get the tooltip.
+  attach.setAttribute('aria-disabled', String(!allowed || S.sending));
   setAttachTip(allowed ? 'Attach image' : 'Text only: this agent does not accept images');
   // Staged or restored images stay in the draft; they just cannot be sent while images are off.
   note.hidden = !(S.conv && !allowed && S.staged.length);
   note.textContent = 'This agent does not accept images right now. Remove them or send when it does.';
   const strip = clear($('compose-attachments'));
   for (const item of S.staged) {
-    const onError = () => {             // an expired or deleted upload: prune it from the draft
-      if (!S.staged.includes(item)) return;
-      S.staged.splice(S.staged.indexOf(item), 1);
-      saveDraft();
-      renderImages();
-      $('compose-error').textContent = `${item.name} is no longer available and was removed from the draft.`;
-    };
-    strip.append(h('div', { class: 'staged-image' },
-      item.image ? thumb(item.image, { onError: item.restored ? onError : null }) : h('span', { class: 'staged-uploading', text: 'Uploading…' }),
+    let tile;
+    if (!item.image) tile = h('span', { class: 'staged-uploading', text: 'Uploading…' });
+    else if (item.broken) {
+      tile = h('button', { type: 'button', class: 'staged-uploading staged-retry', title: `${item.name} could not be loaded`,
+        onclick: () => { item.broken = false; renderImages(); } }, 'Could not load. Retry');
+    } else {
+      tile = thumb(item.image, { onError: item.restored ? (img) => onDraftImageError(item, img) : null });
+    }
+    strip.append(h('div', { class: 'staged-image', 'data-attachment-id': item.image ? item.image.id : null }, tile,
       h('button', { type: 'button', class: 'remove', disabled: S.sending, 'aria-label': 'Remove ' + item.name,
-        onclick: () => { S.staged.splice(S.staged.indexOf(item), 1); saveDraft(); renderImages(); } }, '×')));
+        onclick: () => {
+          item.removed = true;
+          S.staged.splice(S.staged.indexOf(item), 1);
+          saveDraft();
+          renderImages();
+        } }, '×')));
   }
   $('compose-send').disabled = S.sending || S.staged.some((item) => !item.image) || (!allowed && S.staged.length > 0)
     || !($('compose-body').value.trim() || S.staged.length);
@@ -1818,16 +1980,22 @@ async function stageImages(files) {
     error.textContent = 'You can attach up to ' + (settings.max_attachments_per_message || 4) + ' images.';
     return;
   }
+  const key = draftKey();
   for (const file of files) {
     if (!file.size || file.size > (settings.max_attachment_bytes || 10485760)) {
       error.textContent = file.name + ' is empty or exceeds the image size limit.';
       continue;
     }
-    const item = { name: file.name };
+    const item = { name: file.name, token: clientId(), draftKey: key };
     staged.push(item);
     renderImages();
     api('POST', '/api/v1/attachments', file, { 'X-Filename': encodeURIComponent(file.name) })
-      .then((r) => { item.image = r.attachment; if (staged === S.staged) saveDraft(); })
+      .then((r) => {
+        item.image = r.attachment;
+        if (item.removed) return;
+        if (staged === S.staged) saveDraft();           // still on the chat it started in
+        else addToStoredDraft(item.draftKey, item);      // the owner moved on: keep it in that draft
+      })
       .catch((e) => {
         if (staged === S.staged && staged.includes(item)) {
           staged.splice(staged.indexOf(item), 1);
@@ -1837,7 +2005,10 @@ async function stageImages(files) {
   }
 }
 
-$('compose-attach').addEventListener('click', () => $('compose-files').click());
+$('compose-attach').addEventListener('click', () => {
+  if ($('compose-attach').getAttribute('aria-disabled') === 'true') return;   // the tooltip explains why
+  $('compose-files').click();
+});
 $('compose-files').addEventListener('change', (ev) => { stageImages(Array.from(ev.target.files)); ev.target.value = ''; });
 $('composer').addEventListener('paste', (ev) => {
   const files = Array.from(ev.clipboardData.files);
@@ -2116,6 +2287,8 @@ function memberChecks(root, people, selected, locked) {
 
 let editingProject = null;
 let editingTask = null;
+let editingTaskVersion = null;      // the version the owner opened; a newer one on the server is a conflict
+let conflictTask = null;
 let taskProject = null;
 
 function openProjectDialog(p) {
@@ -2175,6 +2348,9 @@ function syncBlockedField() {
 function openTaskDialog(p, t, preset) {
   taskProject = p;
   editingTask = t;
+  editingTaskVersion = t ? t.version : null;
+  conflictTask = null;
+  $('tf-conflict').hidden = true;
   $('task-dialog-title').textContent = t ? 'Edit task' : 'New task';
   $('tf-submit').textContent = t ? 'Save task' : 'Create task';
   $('tf-project').textContent = `Project: ${p.name}`;
@@ -2206,17 +2382,55 @@ $('task-form').addEventListener('submit', async (ev) => {
   if (body.status === 'blocked') body.blocked_reason = $('tf-blocked').value.trim() || null;
   try {
     if (editingTask) {
-      const fresh = findTask(editingTask.id) || editingTask;
-      await api('PATCH', `/api/v1/tasks/${editingTask.id}`, Object.assign({ expected_version: fresh.version }, body));
+      await api('PATCH', `/api/v1/tasks/${editingTask.id}`, Object.assign({ expected_version: editingTaskVersion }, body));
     } else {
       await api('POST', `/api/v1/projects/${taskProject.id}/tasks`, body);
     }
     $('task-dialog').close();
     schedule({ board: true });
   } catch (e) {
-    $('tf-error').textContent = conflictMessage(e);
-    if (e.data && e.data.error === 'version_conflict') schedule({ board: true });
+    if (e.data && e.data.error === 'version_conflict') await showTaskConflict();
+    else $('tf-error').textContent = e.message;
   }
+});
+
+// Someone else saved first: show their version next to the owner's unsaved edits. Saving again
+// is then a deliberate overwrite of exactly that version.
+async function showTaskConflict() {
+  $('tf-error').textContent = '';
+  try {
+    S.board = await api('GET', '/api/v1/board');
+    renderAgents(); renderProjects(); renderSenate();
+  } catch (e) { $('tf-error').textContent = `This task changed elsewhere and the latest version could not be loaded: ${e.message}`; return; }
+  const latest = editingTask && findTask(editingTask.id);
+  if (!latest) { $('tf-error').textContent = 'This task no longer exists.'; return; }
+  conflictTask = latest;
+  editingTaskVersion = latest.version;
+  const kv = clear($('tf-conflict-fields'));
+  const add = (k, v) => kv.append(h('dt', { text: k }), h('dd', { text: v || 'none' }));
+  add('Title', latest.title);
+  add('Status', stateLabel(TASK_STATES, latest.status) + (latest.status === 'blocked' && latest.blocked_reason ? `: ${latest.blocked_reason}` : ''));
+  add('Priority', stateLabel(PRIORITIES, Math.max(0, Math.min(3, latest.priority))));
+  add('Assignees', latest.assignees.map((a) => a.display_name).join(', '));
+  add('Description', (latest.description || '').slice(0, 200));
+  $('tf-conflict').hidden = false;
+  $('tf-submit').textContent = 'Save my version';
+}
+
+$('tf-use-latest').addEventListener('click', () => {
+  const t = conflictTask;
+  if (!t) return;
+  $('tf-title').value = t.title;
+  $('tf-desc').value = t.description || '';
+  $('tf-status').value = t.status;
+  $('tf-priority').value = String(Math.max(0, Math.min(3, t.priority)));
+  $('tf-blocked').value = t.blocked_reason || '';
+  syncBlockedField();
+  const ids = t.assignees.map((a) => a.id);
+  $('tf-assignees').querySelectorAll('input[type="checkbox"]').forEach((i) => { i.checked = ids.includes(Number(i.value)); });
+  $('tf-conflict').hidden = true;
+  $('tf-submit').textContent = 'Save task';
+  conflictTask = null;
 });
 
 document.querySelectorAll('dialog [data-close]').forEach((b) => b.addEventListener('click', () => b.closest('dialog').close()));
@@ -2592,10 +2806,10 @@ document.addEventListener('keydown', (ev) => {
   } else if (key === 'n' || key === 'N') {
     ev.preventDefault();
     stepNeeds(key === 'N' ? -1 : 1);
-  } else if (key === 'x') {
+  } else if (key.toLowerCase() === 'x') {
     ev.preventDefault();
     nextUnread();
-  } else if (key === 'h') {
+  } else if (key.toLowerCase() === 'h') {
     ev.preventDefault();
     toggleSidebar();
   }

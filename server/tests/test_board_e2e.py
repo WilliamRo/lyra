@@ -10,8 +10,13 @@
 #     Details, draft images, projects and tasks (cancelled, blocked reason,
 #     versions), Senate with Server Storage cleanup, notifications toggle,
 #     shortcuts (Ctrl+K, N, X, H, Alt+arrows), SSE reconnect banner
-#   - zero page errors, console errors or CSP violations, and no element that
-#     crosses its rail, card or row container
+#   - Round 1 fixes: task CAS conflicts with an intervening refresh, board then
+#     conversations then events on load, resync after a reset with a failing
+#     reload, a stalled /auth/me, Details races, draft images (404, transient,
+#     mid-upload navigation), Retry with a new attempt, claim-before-cancel 409,
+#     sidebar clamp and Projects split, theme-aware markdown colors, a11y
+#   - zero page errors, console errors or CSP violations (except failures the
+#     probe injected on purpose), and no element that crosses its container
 #   - visual QA screenshots in light and dark (kept when LYRA_QA_SHOTS=<dir>)
 # =============================================================================
 
@@ -49,7 +54,9 @@ class WiredBoardTests(unittest.TestCase):
       chrome.navigate(self.proxy.base + '/?qa=probe')
       chrome.wait_for("!!document.getElementById('lyra-qa')", timeout=150)   # app.js owns the title
       result = json.loads(chrome.eval("document.getElementById('lyra-qa').textContent"))
-      result['console'] = chrome.console_problems()
+      # Failures the probe injected on purpose (proxy hooks) are expected; anything else is a defect.
+      expected = set(self.proxy.qa.expected)
+      result['console'] = [p for p in chrome.console_problems() if not any(e in p for e in expected)]
     finally:
       chrome.close()
     return result
@@ -65,20 +72,66 @@ class WiredBoardTests(unittest.TestCase):
     self.assertEqual(result['overflow'], [], 'elements crossing their containers')
 
   def test_desktop_board_light(self):
-    self.check(self.run_probe(1440, 900), 'desktop', 32)
+    self.check(self.run_probe(1440, 900), 'desktop', 44)
 
   def test_desktop_board_dark(self):
-    self.check(self.run_probe(1440, 900, theme='dark'), 'desktop', 32, theme='dark')
+    self.check(self.run_probe(1440, 900, theme='dark'), 'desktop', 44, theme='dark')
 
   def test_phone_board_light(self):
     r = self.run_probe(390, 844, mobile=True, dpr=2)
     self.assertEqual(r['viewport'], [390, 844])
-    self.check(r, 'mobile', 6)
+    self.check(r, 'mobile', 8)
 
   def test_phone_board_dark(self):
     r = self.run_probe(390, 844, mobile=True, dpr=2, theme='dark')
     self.assertEqual(r['viewport'], [390, 844])
-    self.check(r, 'mobile', 6, theme='dark')
+    self.check(r, 'mobile', 8, theme='dark')
+
+  def test_initial_load_reads_board_then_conversations_then_events(self):
+    # The SSE cursor comes from /board; /conversations must be read after it and the stream opened
+    # last, so no message can fall between the snapshot and the replay.
+    chrome = Chrome().open_page(1440, 900)
+    try:
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.getElementById('live').classList.contains('on')", timeout=20)
+    finally:
+      chrome.close()
+    log = list(self.proxy.qa.log)
+    first = lambda path: next(e for e in log if e['method'] == 'GET' and e['path'] == path)
+    board, convs, events = first('/api/v1/board'), first('/api/v1/conversations'), first('/api/v1/events')
+    self.assertIsNotNone(board['end'])
+    self.assertLessEqual(board['end'], convs['start'], 'conversations requested before the board snapshot finished')
+    self.assertLessEqual(convs['end'], events['start'], 'event stream opened before conversations loaded')
+
+  def test_sidebar_clamp_and_projects_split(self):
+    chrome = Chrome().open_page(1100, 900)
+    try:
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.querySelectorAll('#roster .agent').length >= 6", timeout=20)
+      width = lambda: chrome.eval("getComputedStyle(document.getElementById('pane-agents')).width")
+      chrome.eval("(() => { const r = document.getElementById('sidebar-resizer'); r.focus();"
+                  " r.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true })); return true; })()")
+      self.assertEqual(width(), '462px')                     # floor(1100 * 0.42)
+      self.assertEqual(chrome.eval("document.getElementById('sidebar-resizer').getAttribute('aria-valuemax')"), '462')
+      # A wider stored preference is clamped by CSS as well.
+      chrome.eval("(() => { const s = JSON.parse(localStorage.getItem('lyra.ui.v2.state')); s.sidebarWidth = 560;"
+                  " localStorage.setItem('lyra.ui.v2.state', JSON.stringify(s)); return true; })()")
+      chrome.navigate(self.proxy.base + '/')
+      chrome.wait_for("document.querySelectorAll('#roster .agent').length >= 6", timeout=20)
+      self.assertEqual(width(), '462px')
+      # Projects: one column below 1200 px (like Chats), list and detail side by side from 1200 px.
+      chrome.eval("document.querySelector('[data-tab=\"projects\"]').click()")
+      chrome.wait_for("document.querySelectorAll('.proj-card').length === 2")
+      chrome.eval("[...document.querySelectorAll('.proj-card')].find((c) => c.textContent.includes('Route audit')).click()")
+      chrome.wait_for("document.querySelectorAll('.task').length === 6")
+      self.assertEqual(chrome.eval("getComputedStyle(document.querySelector('.proj-list')).display"), 'none')
+      chrome.send('Emulation.setDeviceMetricsOverride', {'width': 1300, 'height': 900, 'deviceScaleFactor': 1, 'mobile': False})
+      chrome.wait_for("getComputedStyle(document.querySelector('.proj-list')).display !== 'none'")
+      # The window resize event follows the media query by a frame: wait for the re-clamp.
+      chrome.wait_for("document.getElementById('sidebar-resizer').getAttribute('aria-valuemax') === '546'", timeout=5)
+      self.assertEqual(chrome.console_problems(), [])
+    finally:
+      chrome.close()
 
   def test_visual_qa_screenshots(self):
     keep = os.environ.get('LYRA_QA_SHOTS')

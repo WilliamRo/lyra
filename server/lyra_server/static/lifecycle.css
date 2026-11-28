@@ -17,7 +17,7 @@
 .rc-btn:hover { background: var(--hover, rgba(0, 0, 0, .06)); }
 .rc-quiet { color: var(--muted, #5f6368); font-weight: 500; }
 .rc-btn:focus-visible { outline: 2px solid var(--focus, #1a73e8); outline-offset: 1px; }
-@media (pointer: coarse) { .rc-btn { min-height: 44px; padding: 0 .6rem; } }
+@media (pointer: coarse), (max-width: 959px) { .rc-btn { min-height: 44px; padding: 0 .6rem; } }
 
 /* Live agent-side bubble content. */
 .live-status { display: grid; gap: .45rem; font-size: .86rem; }

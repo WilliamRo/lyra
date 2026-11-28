@@ -40,6 +40,29 @@
     return d.scrollWidth <= d.clientWidth + 1;
   }
   function tall(el) { const r = el.getBoundingClientRect(); return r.height >= 43.5 || r.height === 0; }
+  const hook = (q) => fetch('/__qa/' + q).then((r) => r.json());
+  const api = (method, path, body) => fetch(path, { method, credentials: 'same-origin',
+    headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined })
+    .then(async (r) => ({ status: r.status, data: await r.json().catch(() => ({})) }));
+  const convId = (title) => convRow(title).dataset.convId;
+  const state = () => JSON.parse(localStorage.getItem('lyra.ui.v2.state'));
+  function rgb(c) { const m = c.match(/[\d.]+/g).map(Number); return { r: m[0], g: m[1], b: m[2], a: m[3] == null ? 1 : m[3] }; }
+  function over(top, base) { return { r: top.r * top.a + base.r * (1 - top.a), g: top.g * top.a + base.g * (1 - top.a), b: top.b * top.a + base.b * (1 - top.a), a: 1 }; }
+  function lum(c) { return [c.r, c.g, c.b].map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); })
+    .reduce((acc, v, i) => acc + v * [0.2126, 0.7152, 0.0722][i], 0); }
+  function contrast(a, b) { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); }
+  async function pngFile(name) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 64; canvas.height = 40;
+    const g = canvas.getContext('2d'); g.fillStyle = '#facc15'; g.fillRect(0, 0, 64, 40);
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+    return new File([blob], name, { type: 'image/png' });
+  }
+  async function upload(name) {
+    const r = await fetch('/api/v1/attachments', { method: 'POST', credentials: 'same-origin', headers: { 'X-Filename': name },
+      body: await pngFile(name) });
+    return (await r.json()).attachment;
+  }
 
   // Nothing may cross its container: every visible descendant of a rail card, row or card must stay
   // inside it horizontally, unless an ancestor in between clips it (overflow hidden, auto or scroll).
@@ -103,6 +126,8 @@
       const want = t.getAttribute('aria-checked') === 'true' ? 'dark' : 'light';
       ok(document.documentElement.getAttribute('data-theme') === want, 'html data-theme');
       ok(JSON.parse(localStorage.getItem('lyra.ui.v2.state')).theme === want, 'persisted');
+      const metas = qa('meta[name="theme-color"]').map((m) => m.getAttribute('content'));
+      ok(metas.every((c) => c === (want === 'dark' ? '#18191c' : '#eef0f3')), 'theme-color ' + metas);
       t.click();
       await until(() => t.getAttribute('aria-checked') === before, 2000, 'toggle back');
     });
@@ -125,6 +150,32 @@
       ok(q('#roster .avatar.has-image img.avatar-img'), 'Feishu image avatar');
       await until(() => q('#roster .avatar-img').complete && q('#roster .avatar-img').naturalWidth > 0, 4000, 'avatar image loaded');
     });
+    await step('agents: rows follow conversation events (unread sync)', async () => {
+      const row = () => qa('#roster .agent').find((a) => a.querySelector('.agent-name') && a.querySelector('.agent-name').textContent === 'Claude');
+      await until(() => row().querySelector('.agent-extra').textContent.indexOf('1 unread') !== -1, 3000, 'unread shown');
+      const id = convId('Claude');
+      const msgs = (await api('GET', `/api/v1/conversations/${id}/messages?limit=300`)).data.messages;
+      const r = await api('POST', `/api/v1/conversations/${id}/read`, { last_read_message_id: msgs[msgs.length - 1].id });
+      ok(r.status === 200, 'read ' + r.status);
+      await until(() => row().querySelector('.agent-extra').textContent.indexOf('unread') === -1, 4000, 'unread cleared by the event');
+    });
+    await step('agents: group switch is a radiogroup with roving tabindex', async () => {
+      const m = q('.seg-btn[data-group="machine"]'); const pv = q('.seg-btn[data-group="provider"]');
+      ok(m.tabIndex === 0 && pv.tabIndex === -1, 'roving tabindex');
+      m.focus();
+      key(m, 'ArrowDown');
+      await until(() => q('.seg-btn[data-group="provider"]').getAttribute('aria-checked') === 'true', 2000, 'ArrowDown');
+      ok(document.activeElement === q('.seg-btn[data-group="provider"]') && q('.seg-btn[data-group="provider"]').tabIndex === 0, 'focus moved');
+      key(document.activeElement, 'ArrowUp');
+      await until(() => q('.seg-btn[data-group="machine"]').getAttribute('aria-checked') === 'true', 2000, 'ArrowUp');
+    });
+    await step('quota alert: Show pool stays on the current tab on desktop', async () => {
+      const before = state().activeTab;
+      q('#quota-alert button').click();
+      await until(() => q('.seg-btn[data-group="provider"]').getAttribute('aria-checked') === 'true', 2000, 'provider view');
+      ok(state().activeTab === before, 'tab changed to ' + state().activeTab);
+      q('.seg-btn[data-group="machine"]').click();
+    });
     await step('machines: alias, nowrap host names, explicit GB on bars that fill', async () => {
       q('.seg-btn[data-group="machine"]').click();
       await until(() => qa('.rail-group').length >= 3, 3000, 'host groups');
@@ -136,6 +187,14 @@
       const fill = q('.rail-card .mini-meter .fill');
       ok(getComputedStyle(fill).display === 'block' && fill.getBoundingClientRect().height > 0 && fill.getBoundingClientRect().width > 0, 'bar fills');
       await noCrossing('by machine');
+    });
+    await step('machines: Shift+F10 opens the host menu from the keyboard', async () => {
+      const card = qa('.rail-card[data-host]').find((c) => c.textContent.indexOf('build-box') !== -1);
+      card.focus();
+      key(card, 'F10', { shiftKey: true });
+      await until(() => !q('#host-menu').hidden, 2000, 'menu');
+      key(q('#host-menu'), 'Escape');
+      await until(() => q('#host-menu').hidden && document.activeElement && document.activeElement.dataset.host === 'build-box', 2000, 'focus back');
     });
     await step('machines: right-click menu renames a host without prompt()', async () => {
       const card = qa('.rail-card').find((c) => c.textContent.indexOf('studio-linux') !== -1);
@@ -179,6 +238,12 @@
       ok(getComputedStyle(q('#pane-agents')).display === 'none', 'sidebar hidden');
       key(document.body, 'h');
       await until(() => !q('#layout').classList.contains('sidebar-collapsed'), 2000, 'expanded by H');
+      q('.seg-btn[data-group="machine"]').focus();
+      key(document.activeElement, 'H', { shiftKey: true });
+      await until(() => q('#layout').classList.contains('sidebar-collapsed'), 2000, 'collapsed by Shift+H');
+      ok(document.activeElement === q('#sidebar-toggle'), 'focus moved out of the hidden sidebar');
+      key(document.activeElement, 'h');
+      await until(() => !q('#layout').classList.contains('sidebar-collapsed'), 2000, 'expanded again');
       const r = q('#sidebar-resizer');
       r.focus();
       key(r, 'ArrowRight');
@@ -220,6 +285,39 @@
       ok(q('#lifecycle-body table.attempts tbody tr'), 'attempts');
       q('#lifecycle-dialog [data-close]').click();
     });
+    await step('details: a late response never replaces the newer selection', async () => {
+      const mine = qa('#messages .msg.mine[data-msg-id]');
+      const a = mine[0].dataset.msgId; const b = mine[mine.length - 1].dataset.msgId;
+      ok(a !== b, 'two owner messages');
+      await hook(`stall?path=/api/v1/messages/${a}/lifecycle&ms=1500&count=1`);
+      qa(`#messages .msg[data-msg-id="${a}"] .rc-btn`).find((x) => x.textContent === 'Details').click();
+      await wait(100);
+      q('#lifecycle-dialog').close();
+      qa(`#messages .msg[data-msg-id="${b}"] .rc-btn`).find((x) => x.textContent === 'Details').click();
+      await until(() => q('#lifecycle-body .storage-head') && q('#lifecycle-body').textContent.indexOf(`Message #${b}`) !== -1, 4000, 'B shown');
+      await wait(1800);
+      ok(q('#lifecycle-body').textContent.indexOf(`Message #${b}`) !== -1 && q('#lifecycle-body').textContent.indexOf(`Message #${a}:`) === -1, 'late A overwrote B');
+      q('#lifecycle-dialog').close();
+    });
+    await step('markdown colors follow the board theme, not only the OS', async () => {
+      const t = q('#themeToggle');
+      t.click();
+      await wait(80);
+      const el = q('#messages .md-color-green');
+      const bubble = el.closest('.bubble');
+      const bg = rgb(getComputedStyle(bubble).backgroundColor);
+      const fg = rgb(getComputedStyle(el).color);
+      const wash = over(rgb(getComputedStyle(el).backgroundColor), bg);
+      const cr = contrast(fg, wash);
+      t.click();
+      ok(cr >= 4.5, `contrast ${cr.toFixed(2)} in ${state().theme || 'system'} theme`);
+    });
+    await step('a11y: receipts are not live regions, live status keeps text, quick switch is a combobox', async () => {
+      ok(!q('#messages .receipt [role="status"]'), 'historical receipts announce');
+      ok(q('#live .live-text') && q('#live .live-text').textContent === 'live', 'live text');
+      const i = q('#qs-input');
+      ok(i.getAttribute('role') === 'combobox' && i.getAttribute('aria-expanded') === 'true' && i.getAttribute('aria-autocomplete') === 'list', 'combobox');
+    });
     await step('read receipt clears the unread badge', async () => {
       await until(() => { const r = convRow('Dario'); return r && !q('.count-badge', r); }, 4000, 'badge cleared');
     });
@@ -234,13 +332,16 @@
       ok(attach.getAttribute('aria-label') === 'Attach image' && !attach.disabled, 'enabled for an image agent');
       ok(q('#compose-attach-tip').getAttribute('data-tip') === 'Attach image', 'tooltip');
       ok(q('#compose-attach svg'), 'icon');
-      const canvas = document.createElement('canvas');
-      canvas.width = 64; canvas.height = 40;
-      const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+      // The upload is still running when the owner switches chats: it must land in Dario's draft.
+      await hook('stall?path=/api/v1/attachments&ms=1500&count=1');
       const dt = new DataTransfer();
-      dt.items.add(new File([blob], 'sketch.png', { type: 'image/png' }));
+      dt.items.add(await pngFile('sketch.png'));
       q('#composer').dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-      await until(() => q('#compose-attachments .staged-image img'), 4000, 'uploaded thumb');
+      await until(() => q('#compose-attachments .staged-uploading'), 2000, 'uploading tile');
+      await openConvByTitle('Echo');
+      await wait(2000);
+      await openConvByTitle('Dario');
+      await until(() => q('#compose-attachments .staged-image img'), 4000, 'upload saved into the originating draft');
       const box = q('#compose-body');
       box.value = 'Draft for Dario';
       box.dispatchEvent(new Event('input', { bubbles: true }));
@@ -256,13 +357,57 @@
       box.value = '';
       box.dispatchEvent(new Event('input', { bubbles: true }));
     });
+    await step('draft images: a transient error keeps the image, a 404 removes it', async () => {
+      const keep = await upload('keep.png');
+      const gone = await upload('gone.png');
+      const kimi = convId('Kimi'); const codex = convId('Codex');
+      const draft = (img) => JSON.stringify({ text: '', replyToId: null, mode: 'queue', updatedAt: 1,
+        attachments: [{ id: img.id, filename: img.filename, mime_type: 'image/png', size_bytes: img.size_bytes }] });
+      localStorage.setItem('lyra.ui.v2.draft.conv:' + kimi, draft(keep));       // drafts from an earlier session
+      localStorage.setItem('lyra.ui.v2.draft.conv:' + codex, draft(gone));
+      // Re-renders may request a thumbnail again, so the injected outage covers a few requests.
+      await hook(`fail?path=/api/v1/attachments/${keep.id}&status=503&count=3`);
+      await openConvByTitle('Kimi');
+      await until(() => q('#compose-attachments .staged-retry'), 4000, 'retry tile after a 503');
+      ok(JSON.parse(localStorage.getItem('lyra.ui.v2.draft.conv:' + kimi)).attachments.length === 1, 'kept in the draft');
+      await wait(300);
+      await hook(`fail?path=/api/v1/attachments/${keep.id}&status=503&count=0`);
+      const retry = await until(() => q('#compose-attachments .staged-retry'), 2000, 'still a retry tile');
+      retry.click();
+      await until(() => q('#compose-attachments .staged-image img') && q('#compose-attachments .staged-image img').naturalWidth > 0, 4000, 'loads on retry');
+      await hook(`fail?path=/api/v1/attachments/${gone.id}&status=404&count=8`);
+      await openConvByTitle('Codex');
+      await until(() => q('#compose-error').textContent.indexOf('no longer on the server') !== -1, 4000, 'pruned after a 404');
+      const left = localStorage.getItem('lyra.ui.v2.draft.conv:' + codex);
+      ok(!left || JSON.parse(left).attachments.length === 0, 'removed from the draft');
+      ok(!q('#compose-attachments .staged-image'), 'no tile');
+    });
+    await step('cancel: a message claimed first answers 409 and says it is too late', async () => {
+      await until(() => q('#messages .receipt[data-kind="server"] .rc-btn'), 3000, 'Cancel on the waiting message');
+      const waitingId = q('#messages .receipt[data-kind="server"]').closest('.msg').dataset.msgId;
+      await hook(`expect?path=/api/v1/messages/${waitingId}/cancel`);
+      const claimed = await hook('claim?handle=codex&ack=none');
+      ok(claimed.message_id, 'codex claimed ' + JSON.stringify(claimed));
+      qa('#messages .receipt[data-kind="server"] .rc-btn').find((b) => b.textContent === 'Cancel').click();
+      await until(() => q('#compose-error').textContent.indexOf('Too late to cancel') === 0, 4000, '409 message');
+    });
     await step('queue: held agent, cancel a waiting message, cancelled receipt, text-only attach', async () => {
       await openConvByTitle('Claude');
       ok(q('#conv-header .pill.hold'), 'held pill in header');
       const labels = qa('#messages .msg.mine .rc-label').map((l) => l.textContent);
       ok(labels.includes('Server, #2 in queue') && labels.includes('Cancelled'), 'labels ' + labels.join(' | '));
       const attach = q('#compose-attach');
-      ok(attach.disabled && attach.getAttribute('aria-label').indexOf('Text only') === 0, 'text-only attach');
+      ok(!attach.disabled && attach.getAttribute('aria-disabled') === 'true' && attach.getAttribute('aria-label').indexOf('Text only') === 0, 'text-only attach');
+      attach.focus();
+      ok(document.activeElement === attach, 'still focusable');
+      await until(() => getComputedStyle(q('#compose-attach-tip'), '::after').opacity === '1', 2000, 'tooltip on focus');
+      const files = q('#compose-files'); let opened = false;
+      const spy = () => { opened = true; };
+      files.addEventListener('click', spy, { once: true });
+      attach.click();
+      ok(!opened, 'file picker opened while disabled');
+      files.removeEventListener('click', spy);
+      attach.blur();
       const before = qa('#messages .receipt[data-kind="cancelled"]').length;
       q('#messages .receipt[data-kind="server"] .rc-btn').click();
       await until(() => qa('#messages .receipt[data-kind="cancelled"]').length === before + 1, 4000, 'cancelled');
@@ -276,15 +421,26 @@
       key(document.body, 'n');
       await until(() => q('#conv-header .who-name').textContent.indexOf('Echo') !== -1, 4000, 'Echo next');
     });
-    await step('unconfirmed delivery offers retry', async () => {
-      await until(() => q('#messages .receipt[data-kind="unconfirmed"] .rc-btn'), 4000, 'Retry button');
+    await step('unconfirmed: Retry re-queues, the agent claims again, Details shows two attempts', async () => {
+      const retryBtn = await until(() => qa('#messages .receipt[data-kind="unconfirmed"] .rc-btn').find((b) => b.textContent === 'Retry'), 4000, 'Retry button');
+      const msg = retryBtn.closest('.msg').dataset.msgId;
+      retryBtn.click();
+      await until(() => q(`#messages .msg[data-msg-id="${msg}"] .receipt[data-kind="server"]`), 4000, 're-queued');
+      ok(q(`#messages .msg[data-msg-id="${msg}"] .pill`).textContent === 'retried', 'retried pill');
+      const claimed = await hook('claim?handle=echo&ack=delivered');
+      ok(String(claimed.message_id) === msg, 'echo claimed ' + JSON.stringify(claimed));
+      await until(() => q(`#messages .msg[data-msg-id="${msg}"] .receipt[data-kind="read"]`), 4000, 'agent read');
+      qa(`#messages .msg[data-msg-id="${msg}"] .rc-btn`).find((b) => b.textContent === 'Details').click();
+      await until(() => qa('#lifecycle-body table.attempts tbody tr').length === 2, 4000, 'two attempts');
+      ok(q('#lifecycle-body table.attempts tbody tr:last-child').textContent.indexOf('delivered') !== -1, 'new attempt delivered');
+      q('#lifecycle-dialog').close();
     });
     await step('x jumps to the next unread conversation', async () => {
       document.activeElement && document.activeElement.blur && document.activeElement.blur();
       const unread = qa('.conv-row.unread').map((r) => r.dataset.convId);
       ok(unread.length >= 1, 'unread rows');
-      key(document.body, 'x');
-      await until(() => q('.conv-row.active') && unread.includes(q('.conv-row.active').dataset.convId), 3000, 'x opened an unread conversation');
+      key(document.body, 'X', { shiftKey: true });
+      await until(() => q('.conv-row.active') && unread.includes(q('.conv-row.active').dataset.convId), 3000, 'X opened an unread conversation');
     });
     await step('team conversation is read only', async () => {
       await openConvByTitle('Claude and Dario');
@@ -348,6 +504,28 @@
       await until(() => !q('#task-dialog').open, 3000, 'saved');
       await until(() => qa('.task-blocked').some((b) => b.textContent === 'Blocked: Needs the final rubric'), 4000, 'reason shown');
     });
+    await step('tasks: a second editor\'s save is never overwritten silently (CAS)', async () => {
+      const row = await until(() => qa('.task').find((x) => x.querySelector('.task-title').textContent === 'KaTeX font MIME types'), 3000, 'task');
+      qa('button', row).find((b) => b.textContent === 'Edit').click();
+      await until(() => q('#task-dialog').open, 2000, 'dialog');
+      q('#tf-title').value = 'KaTeX font MIME types (mine)';
+      // Another editor saves meanwhile, and a board refresh arrives while the dialog stays open.
+      const proj = (await api('GET', '/api/v1/projects')).data.projects.find((p) => p.name === 'Route audit');
+      const t = proj.tasks.find((x) => x.title === 'KaTeX font MIME types');
+      const other = await api('PATCH', `/api/v1/tasks/${t.id}`, { title: 'KaTeX font MIME types (theirs)', expected_version: t.version });
+      ok(other.status === 200, 'other editor ' + other.status);
+      await until(() => qa('.task-title').some((x) => x.textContent === 'KaTeX font MIME types (theirs)'), 4000, 'refresh with theirs');
+      ok(q('#task-dialog').open && q('#tf-title').value === 'KaTeX font MIME types (mine)', 'edits kept during refresh');
+      await hook(`expect?path=/api/v1/tasks/${t.id}`);
+      q('#task-form').requestSubmit();
+      await until(() => !q('#tf-conflict').hidden, 4000, 'conflict shown');
+      ok(q('#tf-conflict-fields').textContent.indexOf('KaTeX font MIME types (theirs)') !== -1, 'their version listed');
+      ok(qa('.task-title').some((x) => x.textContent === 'KaTeX font MIME types (theirs)'), 'theirs not overwritten');
+      ok(q('#tf-title').value === 'KaTeX font MIME types (mine)', 'my edits kept');
+      q('#task-form').requestSubmit();
+      await until(() => !q('#task-dialog').open, 4000, 'deliberate save');
+      await until(() => qa('.task-title').some((x) => x.textContent === 'KaTeX font MIME types (mine)'), 4000, 'mine saved');
+    });
     await step('task dialog lists only project members and requires one', async () => {
       qa('button').find((b) => b.textContent === 'New task').click();
       await until(() => q('#task-dialog').open, 2000, 'task dialog');
@@ -382,6 +560,23 @@
       await until(() => !q('#conn-banner').hidden && q('#conn-text').textContent.indexOf('Reconnecting') !== -1, 5000, 'banner');
       await until(() => q('#live').classList.contains('on'), 8000, 'reconnected');
       await until(() => q('#conn-banner').hidden || q('#conn-banner').classList.contains('is-ok'), 3000, 'banner cleared');
+    });
+    await step('reset: the reload retries after a 503 and the banner clears', async () => {
+      await until(() => q('#live').classList.contains('on') && q('#conn-banner').hidden, 8000, 'calm');
+      await hook('fail?path=/api/v1/board&status=503&count=1');
+      await hook('reset-next');
+      await fetch('/__qa/drop-sse');
+      await until(() => !q('#conn-banner').hidden && q('#conn-text').textContent.indexOf('Resyncing') !== -1, 8000, 'resync banner');
+      await until(() => q('#conn-banner').hidden && q('#live').classList.contains('on'), 10000, 'resynced');
+      ok(qa('#roster .agent').length >= 6, 'board reloaded');
+    });
+    await step('reconnect: a stalled /auth/me never delays the banner or the retry', async () => {
+      await hook('stall?path=/api/v1/auth/me&ms=8000&count=1');
+      await fetch('/__qa/drop-sse');
+      const t0 = Date.now();
+      await until(() => !q('#conn-banner').hidden && q('#conn-text').textContent.indexOf('Reconnecting') !== -1, 2000, 'banner');
+      ok(Date.now() - t0 < 1500, 'banner after ' + (Date.now() - t0) + ' ms');
+      await until(() => q('#live').classList.contains('on'), 6000, 'reconnected while /auth/me stalls');
     });
     await step('layout: no horizontal page overflow', async () => { ok(noOverflow(), 'page overflows'); });
   }
@@ -422,6 +617,21 @@
       back.click();
       await until(() => q('.chats').dataset.view === 'list', 2000, 'list view');
     });
+    await step('mobile: 44 px targets for receipts, copy, delivery, Show pool; live text stays readable', async () => {
+      const big = (el, what) => { const r = el.getBoundingClientRect(); ok(r.height >= 43.5 && r.width > 0, `${what} is ${Math.round(r.width)}x${Math.round(r.height)}`); };
+      q('.conv-main', convRow('Dario')).click();
+      await until(() => q('.chats').dataset.view === 'thread' && q('#messages .rc-btn') && q('#messages .md-code-copy'), 4000, 'thread');
+      qa('#messages .rc-btn').forEach((b) => big(b, 'receipt button'));
+      qa('#messages .md-code-copy').forEach((b) => big(b, 'copy button'));
+      big(q('#compose-mode'), 'delivery select');
+      big(q('#compose-attach'), 'attach');
+      ok(q('#live .live-text').textContent === 'live' && q('#live .live-text').getBoundingClientRect().width <= 1, 'visually hidden live text');
+      q('.conv-back').click();
+      q('[data-tab="agents"]').click();
+      await until(() => q('#quota-alert button').getBoundingClientRect().height > 0, 2000, 'agents tab');
+      big(q('#quota-alert button'), 'Show pool');
+      q('[data-tab="chats"]').click();
+    });
     await step('mobile: imgpop uses the near-fullscreen frame', async () => {
       q('.conv-main', convRow('Dario')).click();
       await until(() => q('#messages .image-strip img'), 4000, 'thumb');
@@ -430,6 +640,14 @@
       const r = q('#imgpop-dialog').getBoundingClientRect();
       ok(Math.abs(r.width - (window.innerWidth - 16)) < 2, 'frame width ' + r.width);
       q('.lyra-imgpop-close').click();
+    });
+    await step('mobile: task assignee buttons are 44 px', async () => {
+      q('[data-tab="projects"]').click();
+      await until(() => qa('.proj-card').length === 2, 3000, 'projects');
+      qa('.proj-card').find((c) => c.textContent.indexOf('Route audit') !== -1).click();
+      await until(() => qa('.task').length === 6, 3000, 'tasks');
+      qa('.task-who button').forEach((b) => ok(tall(b) && b.getBoundingClientRect().width >= 43.5, 'short assignee button'));
+      await noCrossing('mobile tasks');
     });
     await step('mobile: senate and storage fit the phone', async () => {
       q('[data-tab="senate"]').click();

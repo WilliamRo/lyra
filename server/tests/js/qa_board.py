@@ -4,8 +4,15 @@
 #                  only through the public HTTP API (owner cookie, agent tokens)
 #   QAProxy      - a test-only reverse proxy in front of it that signs the
 #                  browser in (cookie + Origin), injects /__qa/probe.js into "/"
-#                  when ?qa=probe, and can drop live SSE streams (/__qa/drop-sse)
-#                  to exercise the reconnect banner
+#                  when ?qa=probe, logs request timing, and offers hooks:
+#                    /__qa/drop-sse            drop live SSE streams
+#                    /__qa/fail?path&status&count   answer the next requests with an error
+#                    /__qa/stall?path&ms&count      delay the next requests
+#                    /__qa/reset-next          next /events asks for a cursor ahead of the
+#                                              server, so it answers with `event: reset`
+#                    /__qa/claim?handle&ack    let a seeded agent claim (and ack) a message
+#                    /__qa/expect?path         mark a deliberate error response as expected
+#                    /__qa/log                 the request log as JSON
 # Nothing here ships: it lives under server/tests and the server is unchanged.
 # =============================================================================
 
@@ -297,6 +304,26 @@ class SeededBoard:
 QA_FILES = {'probe.js': 'text/javascript', 'favicon.html': 'text/html', 'favicon.css': 'text/css'}
 
 
+class QAState:
+  """Hooks and the request log shared by one proxy's handler threads."""
+
+  def __init__(self):
+    self.lock = threading.Lock()
+    self.fail = []          # [{'path', 'status', 'count'}]
+    self.stall = []         # [{'path', 'ms', 'count'}]
+    self.reset_next = False
+    self.log = []           # [{'method', 'path', 'start', 'end', 'status'}]
+    self.expected = set()   # paths with injected failures or stalls (their console noise is expected)
+
+  def take(self, rules, path):
+    with self.lock:
+      for r in rules:
+        if r['path'] == path and r['count'] > 0:
+          r['count'] -= 1
+          return r
+    return None
+
+
 class _ProxyHandler(BaseHTTPRequestHandler):
   protocol_version = 'HTTP/1.1'
   board = None
@@ -319,10 +346,58 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(data)
 
+  def _json(self, status, obj):
+    body = json.dumps(obj).encode()
+    self.send_response(status)
+    self.send_header('Content-Type', 'application/json')
+    self.send_header('Content-Length', str(len(body)))
+    self.send_header('Cache-Control', 'no-store')
+    self.end_headers()
+    self.wfile.write(body)
+
+  def _hook(self, name, q):
+    qa = self.qa
+    one = lambda k, d=None: (q.get(k) or [d])[0]
+    if name in ('fail', 'stall'):
+      rule = {'path': one('path'), 'count': int(one('count', 1))}
+      if name == 'fail':
+        rule['status'] = int(one('status', 503))
+      else:
+        rule['ms'] = int(one('ms', 1500))
+      with qa.lock:
+        if rule['count'] == 0:               # count=0 disarms every pending rule for that path
+          for r in getattr(qa, name):
+            if r['path'] == rule['path']:
+              r['count'] = 0
+        else:
+          getattr(qa, name).append(rule)
+        qa.expected.add(rule['path'])
+      return self._json(200, {'armed': rule})
+    if name == 'expect':                       # a deliberate error response (e.g. a 409 under test)
+      with qa.lock:
+        qa.expected.add(one('path'))
+      return self._json(200, {'expected': one('path')})
+    if name == 'reset-next':
+      qa.reset_next = True
+      return self._json(200, {'armed': True})
+    if name == 'claim':
+      agent = self.board.agents[one('handle')]
+      got = agent.call('POST', '/api/v1/deliveries/claim?wait=0')
+      ack = one('ack', 'delivered')
+      if got.get('lease_id') and ack != 'none':
+        agent.call('POST', f"/api/v1/deliveries/{got['lease_id']}/{ack}", {})
+      return self._json(200, {'message_id': (got.get('message') or {}).get('id'), 'reason': got.get('reason')})
+    if name == 'log':
+      with qa.lock:
+        return self._json(200, {'log': list(qa.log), 'expected': sorted(qa.expected)})
+    return None
+
   def _forward(self):
     u = urlsplit(self.path)
     if u.path.startswith('/__qa/'):
       name = u.path[len('/__qa/'):]
+      if self._hook(name, parse_qs(u.query)) is not None or name in ('fail', 'stall', 'expect', 'reset-next', 'claim', 'log'):
+        return
       if name == 'drop-sse':
         with self.sse_lock:
           for sock in list(self.sse):
@@ -341,15 +416,39 @@ class _ProxyHandler(BaseHTTPRequestHandler):
     n = int(self.headers.get('Content-Length') or 0)
     body = self.rfile.read(n) if n else None
     board = self.board
+    entry = {'method': self.command, 'path': u.path, 'start': time.monotonic(), 'end': None, 'status': None}
+    with self.qa.lock:
+      self.qa.log.append(entry)
+    failing = self.qa.take(self.qa.fail, u.path)
+    if failing:
+      self._json(failing['status'], {'error': 'qa_injected', 'message': f"QA injected {failing['status']}"})
+      entry['end'], entry['status'] = time.monotonic(), failing['status']
+      return
+    stalling = self.qa.take(self.qa.stall, u.path)
+    if stalling:
+      time.sleep(stalling['ms'] / 1000)
+    query = u.query
+    if u.path == '/api/v1/events' and self.qa.reset_next:
+      self.qa.reset_next = False
+      query = 'last=999999999'                 # ahead of the server: it answers with event: reset
     conn = http.client.HTTPConnection('127.0.0.1', board.settings.port, timeout=120)
     headers = {k: v for k, v in self.headers.items() if k.lower() not in ('host', 'cookie', 'origin', 'connection')}
     headers['Host'] = f'127.0.0.1:{board.settings.port}'
     headers['Cookie'] = board.owner.cookie
     if self.command not in ('GET', 'HEAD'):
       headers['Origin'] = board.base
-    path = u.path + ('?' + u.query if u.query and not u.query.startswith('qa=') else '')
-    conn.request(self.command, path, body=body, headers=headers)
-    resp = conn.getresponse()
+    path = u.path + ('?' + query if query and not query.startswith('qa=') else '')
+    try:
+      conn.request(self.command, path, body=body, headers=headers)
+      resp = conn.getresponse()
+    except OSError:                       # the seeded server already stopped (test teardown)
+      entry['end'], entry['status'] = time.monotonic(), 502
+      try:
+        self._json(502, {'error': 'upstream_gone'})
+      except OSError:
+        pass
+      return
+    entry['status'] = resp.status
     is_sse = (resp.getheader('Content-Type') or '').startswith('text/event-stream')
     payload = None if is_sse else resp.read()
     if u.path == '/' and 'qa=probe' in (u.query or '') and payload:
@@ -379,20 +478,33 @@ class _ProxyHandler(BaseHTTPRequestHandler):
         with self.sse_lock:
           self.sse.discard(self.connection)
         conn.close()
+        entry['end'] = time.monotonic()
       return
     self.send_header('Content-Length', str(len(payload)))
     self.end_headers()
     self.wfile.write(payload)
     conn.close()
+    entry['end'] = time.monotonic()
 
   do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _forward
 
 
+class _QuietServer(ThreadingHTTPServer):
+  daemon_threads = True
+
+  def handle_error(self, request, client_address):
+    # Browsers drop idle keep-alive connections at will; only report real handler errors.
+    if isinstance(sys.exc_info()[1], OSError):
+      return
+    super().handle_error(request, client_address)
+
+
 class QAProxy:
   def __init__(self, board):
-    handler = type('BoundProxy', (_ProxyHandler,), {'board': board, 'sse': set(), 'sse_lock': threading.Lock()})
-    self.httpd = ThreadingHTTPServer(('127.0.0.1', 0), handler)
-    self.httpd.daemon_threads = True
+    self.qa = QAState()
+    handler = type('BoundProxy', (_ProxyHandler,), {'board': board, 'sse': set(), 'sse_lock': threading.Lock(),
+                                                    'qa': self.qa})
+    self.httpd = _QuietServer(('127.0.0.1', 0), handler)
     self.base = f'http://127.0.0.1:{self.httpd.server_address[1]}'
     threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
