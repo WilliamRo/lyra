@@ -14,7 +14,10 @@ from .events import ApiError
 HANDLE_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,31}$')
 RESERVED_HANDLES = {'owner', 'admin', 'lyra', 'system'}
 MODES = ('queue', 'jump')
-STATUS_KEYS = ('model', 'effort', 'context_pct', 'busy', 'attached', 'version', 'gate')
+STATUS_KEYS = ('model', 'effort', 'context_pct', 'busy', 'attached', 'version', 'gate', 'activity')
+ACTIVITY_STATES = ('busy', 'idle', 'waiting_input', 'unknown')
+IDLE_SOURCES = ('stop', 'stop_failure', 'idle_prompt')
+AVATAR_IMAGE_RE = re.compile(r'^/static/avatars/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$')
 
 
 def _clip(value, limit):
@@ -31,12 +34,14 @@ def clean_avatar(value):
       ch in '-_ \u200d' or unicodedata.category(ch)[0] in 'LNMS' and ch not in '<>=$'
       for ch in icon))
   if isinstance(value, dict):
-    if (not value or set(value) - {'icon', 'color'} or
+    if (not value or set(value) - {'icon', 'color', 'image'} or
         ('icon' in value and not safe_icon(value['icon'])) or
+        ('image' in value and (not isinstance(value['image'], str) or '..' in value['image']
+                               or not AVATAR_IMAGE_RE.fullmatch(value['image']))) or
         ('color' in value and (not isinstance(value['color'], str) or not re.fullmatch(
           r'(?:#[0-9a-fA-F]{3,4}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8}|[A-Za-z][A-Za-z0-9-]{0,31})',
           value['color'])))):
-      raise ApiError(422, 'bad_avatar', 'expected a safe icon and color')
+      raise ApiError(422, 'bad_avatar', 'expected a safe icon, color, or image path')
   elif not safe_icon(value):
     raise ApiError(422, 'bad_avatar', 'invalid avatar preset')
   encoded = dumps(value)
@@ -311,14 +316,24 @@ class RegistryMixin:
               "VALUES (?, ?, ?, 'active', ?)", (pid, security.token_hash(token), invite_id, now))
     return token
 
-  def _join_result(self, p, token, rotated):
+  def _server_policy(self):
     s = self.settings
+    return {
+      'checkin_interval_sec': s.checkin_interval_sec,
+      'checkin_ttl_sec': s.checkin_ttl_sec,
+      'lease_sec': s.lease_sec,
+      'claim_wait_max_sec': 55,
+      'progress_stale_sec': s.progress_stale_sec,
+      'stall_sec': s.stall_sec,
+      'progress_ttl_sec': s.progress_ttl_sec,
+    }
+
+  def _join_result(self, p, token, rotated):
     return {
       'token': token, 'rotated': rotated,
       'principal': {'id': p['id'], 'handle': p['handle'], 'display_name': p['display_name'],
                     'address': p['address']},
-      'server': {'checkin_interval_sec': s.checkin_interval_sec,
-                 'checkin_ttl_sec': s.checkin_ttl_sec, 'lease_sec': s.lease_sec},
+      'server': self._server_policy(),
     }
 
   def principal_for_token(self, token):
@@ -381,29 +396,85 @@ class RegistryMixin:
   # --- check-ins and presence ----------------------------------------------
 
   def _upsert_presence(self, c, pid, data, now, online):
-    status = {k: data.get('status', {}).get(k) for k in STATUS_KEYS} \
-      if isinstance(data.get('status'), dict) else {}
+    raw_status = data.get('status') if isinstance(data.get('status'), dict) else {}
+    status = {k: raw_status.get(k) for k in STATUS_KEYS if k != 'activity'}
     if isinstance(status.get('context_pct'), (int, float)):
       status['context_pct'] = max(0.0, min(100.0, float(status['context_pct'])))
     for k in ('model', 'effort', 'version', 'gate'):
       status[k] = _clip(status.get(k), 64)
+    act = raw_status.get('activity') if isinstance(raw_status.get('activity'), dict) else None
+    act_state = act.get('state') if act and act.get('state') in ACTIVITY_STATES else None
+    idle_src = act.get('idle_source') if act and act.get('idle_source') in IDLE_SOURCES else None
+    def _ts(val):
+      return float(val) if type(val) in (int, float) and math.isfinite(val) and val > 0 else None
+    act_since = _ts(act.get('since')) if act else None
+    last_act = _ts(act.get('last_activity_at')) if act else None
+    turn_started = _ts(act.get('turn_started_at')) if act else None
+    if act:
+      status['activity'] = {k: v for k, v in (
+        ('state', act_state), ('idle_source', idle_src), ('since', act_since),
+        ('last_activity_at', last_act), ('turn_started_at', turn_started),
+      ) if v is not None}
     row = (
       pid, _clip(data.get('instance_id'), 120), _clip(data.get('host'), 120),
       _clip(data.get('provider'), 40), _clip(data.get('runtime'), 40),
       _clip(data.get('connector'), 60), dumps(clean_modes(data.get('modes'))), dumps(status),
       dumps(clean_capabilities(data.get('capabilities'))), dumps(clean_host_metrics(data.get('host_metrics'))),
       now if online else None, 1 if online else 0,
+      act_state, act_since, last_act, turn_started,
     )
     c.execute(
       'INSERT INTO presence(principal_id, instance_id, host, provider, runtime, connector, modes, '
-      'status, capabilities, host_metrics, last_checkin_at, online) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+      'status, capabilities, host_metrics, last_checkin_at, online, activity_state, activity_since, '
+      'last_activity_at, turn_started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
       'ON CONFLICT(principal_id) DO UPDATE SET instance_id=excluded.instance_id, '
       'host=COALESCE(excluded.host, host), provider=COALESCE(excluded.provider, provider), '
       'runtime=COALESCE(excluded.runtime, runtime), connector=COALESCE(excluded.connector, connector), '
       'modes=excluded.modes, status=excluded.status, capabilities=excluded.capabilities, host_metrics=excluded.host_metrics, '
-      'last_checkin_at=COALESCE(excluded.last_checkin_at, last_checkin_at), online=excluded.online',
+      'last_checkin_at=COALESCE(excluded.last_checkin_at, last_checkin_at), online=excluded.online, '
+      'activity_state=excluded.activity_state, activity_since=excluded.activity_since, '
+      'last_activity_at=excluded.last_activity_at, turn_started_at=excluded.turn_started_at',
       row,
     )
+
+  def _active_progress_row(self, c, pid):
+    return c.execute("""
+      SELECT mp.phase, mp.updated_at FROM message_progress mp
+      JOIN messages m ON m.id = mp.message_id
+      WHERE m.recipient_id=? AND mp.phase != 'done'
+      ORDER BY mp.updated_at DESC LIMIT 1
+    """, (pid,)).fetchone()
+
+  def _derive_presence(self, r, now, active_row):
+    last_at = r['last_checkin_at']
+    ttl = self.settings.checkin_ttl_sec
+    online = bool(r['online'] and last_at is not None and now - last_at <= ttl)
+    if not online:
+      return False, 'offline', (last_at + ttl) if last_at is not None else None
+    status = loads(r['status'], {})
+    act_state = r['activity_state']
+    act_since = r['activity_since']
+    last_act = r['last_activity_at']
+    turn_started = r['turn_started_at']
+    busy_flag = status.get('busy')
+    prog_phase = active_row['phase'] if active_row else None
+    prog_updated = active_row['updated_at'] if active_row else None
+    if status.get('attached') is False:
+      return True, 'detached', act_since or last_at
+    if act_state == 'waiting_input' or prog_phase == 'input_required':
+      return True, 'needs_input', act_since or prog_updated or last_at
+    is_working = bool(prog_phase or busy_flag is True or act_state == 'busy')
+    refs = [x for x in (prog_updated, last_act, turn_started) if isinstance(x, (int, float))]
+    act_ref = max(refs) if refs else None
+    if is_working and isinstance(last_act, (int, float)) and (now - last_act) > self.settings.stall_sec:
+      return True, 'stalled', last_act + self.settings.stall_sec
+    if prog_phase and (now - (act_ref if act_ref is not None else prog_updated)) > self.settings.progress_stale_sec:
+      return True, 'stale', (act_ref if act_ref is not None else prog_updated) + self.settings.progress_stale_sec
+    if is_working:
+      return True, 'working', turn_started or prog_updated or act_since or last_at
+    if busy_flag is None and act_state not in ('idle', 'busy', 'waiting_input'):
+      return True, 'unknown', act_since or last_at
+    return True, 'idle', act_since or last_at
 
   def checkin(self, principal, data):
     now = self.now()
@@ -419,17 +490,23 @@ class RegistryMixin:
                        'another live instance holds this identity', holder=prev['instance_id'])
       old_modes = loads(prev['modes'], []) if prev else []
       old_status = loads(prev['status'], {}) if prev else {}
+      old_derived = prev['derived_status'] if prev else None
       was_online = bool(prev and prev['online'])
       self._upsert_presence(c, pid, data, now, online=True)
-      cur = c.execute('SELECT host, modes, status, capabilities, host_metrics FROM presence WHERE principal_id=?', (pid,)).fetchone()
+      cur = c.execute('SELECT * FROM presence WHERE principal_id=?', (pid,)).fetchone()
+      active = self._active_progress_row(c, pid)
+      _, eff, eff_since = self._derive_presence(cur, now, active)
+      c.execute('UPDATE presence SET derived_status=? WHERE principal_id=?', (eff, pid))
       if not was_online:
-        self.events.append(c, 'presence', id=pid, online=True)
+        self.events.append(c, 'presence', id=pid, online=True, effective_status=eff, since=eff_since)
       elif cur['host'] != prev['host'] or \
           _metrics_summary(loads(prev['host_metrics'], {})) != _metrics_summary(loads(cur['host_metrics'], {})) or \
           clean_capabilities(loads(prev['capabilities'])) != loads(cur['capabilities']) or \
           loads(cur['modes'], []) != old_modes or \
-          loads(cur['status'], {}).get('busy') != old_status.get('busy'):
-        self.events.append(c, 'presence', id=pid, online=True, changed=True)
+          loads(cur['status'], {}).get('busy') != old_status.get('busy') or \
+          (old_derived is not None and eff != old_derived):
+        self.events.append(c, 'presence', id=pid, online=True, changed=True,
+                           effective_status=eff, since=eff_since)
       # i. Only the pool's designated reporter may write pool usage.
       usage = clean_usage(data.get('usage'))
       if usage and principal['pool_id']:
@@ -445,6 +522,9 @@ class RegistryMixin:
     return {
       'ok': True, 'accepted_usage': accepted_usage,
       'checkin_interval_sec': self.settings.checkin_interval_sec, 'checkin_ttl_sec': ttl,
+      'server': self._server_policy(),
+      'hold': ({'reason': principal['hold_reason'], 'since': principal['hold_since']}
+               if principal['hold_since'] is not None else None),
     }
 
   def sweep_presence(self, c, now):
@@ -452,43 +532,81 @@ class RegistryMixin:
     rows = c.execute('SELECT principal_id FROM presence WHERE online=1 AND '
                      '(last_checkin_at IS NULL OR last_checkin_at < ?)', (now - ttl,)).fetchall()
     for r in rows:
-      c.execute('UPDATE presence SET online=0 WHERE principal_id=?', (r['principal_id'],))
-      self.events.append(c, 'presence', id=r['principal_id'], online=False)
+      c.execute("UPDATE presence SET online=0, derived_status='offline' WHERE principal_id=?",
+                (r['principal_id'],))
+      self.events.append(c, 'presence', id=r['principal_id'], online=False, effective_status='offline')
     return len(rows)
 
+  def sweep_derived_presence(self, c, now):
+    """Emit presence transitions when time passes into stale or stalled without a new check-in."""
+    rows = c.execute('SELECT * FROM presence WHERE online=1').fetchall()
+    changed = 0
+    for r in rows:
+      active = self._active_progress_row(c, r['principal_id'])
+      online, eff, since = self._derive_presence(r, now, active)
+      if online and eff != r['derived_status']:
+        c.execute('UPDATE presence SET derived_status=? WHERE principal_id=?',
+                  (eff, r['principal_id']))
+        self.events.append(c, 'presence', id=r['principal_id'], online=True,
+                           changed=True, effective_status=eff, since=since)
+        changed += 1
+    return changed
+
   def presence_view(self, pid):
-    r = self.db.one('SELECT * FROM presence WHERE principal_id=?', (pid,))
-    if not r:
-      return {'online': False, 'effective_status': 'offline', 'last_checkin_at': None,
-              'modes': ['queue'], 'status': {}, 'capabilities': clean_capabilities(None),
-              'host_metrics': {}}
-    now = self.now()
-    online = bool(r['online'] and r['last_checkin_at'] is not None and now - r['last_checkin_at']
-                  <= self.settings.checkin_ttl_sec)
-    status = loads(r['status'], {})
-    effective_status = 'offline'
-    if online:
-      active = self.db.one("""
-        SELECT mp.updated_at FROM message_progress mp
-        JOIN messages m ON m.id = mp.message_id
-        WHERE m.recipient_id=? AND mp.phase != 'done'
-        ORDER BY mp.updated_at DESC LIMIT 1
-      """, (pid,))
-      if active:
-        effective_status = ('stale' if now - active['updated_at'] > self.settings.progress_stale_sec
-                            else 'working')
-      elif status.get('busy'):
-        effective_status = 'working'
-      else:
-        effective_status = 'idle'
+    with self.db.lock:
+      r = self.db.conn.execute('SELECT * FROM presence WHERE principal_id=?', (pid,)).fetchone()
+      if not r:
+        return {'online': False, 'effective_status': 'offline', 'effective_since': None,
+                'last_checkin_at': None, 'modes': ['queue'], 'status': {},
+                'capabilities': clean_capabilities(None), 'host_metrics': {}}
+      active = self._active_progress_row(self.db.conn, pid)
+    online, eff, eff_since = self._derive_presence(r, self.now(), active)
     return {
-      'online': online, 'effective_status': effective_status,
+      'online': online, 'effective_status': eff, 'effective_since': eff_since,
       'last_checkin_at': r['last_checkin_at'], 'instance_id': r['instance_id'],
       'host': r['host'], 'provider': r['provider'], 'runtime': r['runtime'],
       'connector': r['connector'], 'modes': loads(r['modes'], ['queue']),
-      'status': status, 'host_metrics': loads(r['host_metrics'], {}),
+      'status': loads(r['status'], {}), 'host_metrics': loads(r['host_metrics'], {}),
       'capabilities': clean_capabilities(loads(r['capabilities']) if online else None),
     }
+
+  def hold_principal(self, pid, hold, reason=None):
+    now = self.now()
+    with self.db.tx() as c:
+      p = c.execute("SELECT * FROM principals WHERE id=? AND kind='agent'", (pid,)).fetchone()
+      if not p:
+        raise ApiError(404, 'no_principal', 'unknown agent')
+      if hold:
+        clean_reason = _clip(reason, 240) or 'paused by administrator'
+        c.execute('UPDATE principals SET hold_reason=?, hold_since=? WHERE id=?',
+                  (clean_reason, p['hold_since'] or now, pid))
+        self.events.append(c, 'principal', id=pid, action='held', reason=clean_reason)
+      else:
+        c.execute('UPDATE principals SET hold_reason=NULL, hold_since=NULL WHERE id=?', (pid,))
+        self.events.append(c, 'principal', id=pid, action='resumed')
+      updated = c.execute('SELECT * FROM principals WHERE id=?', (pid,)).fetchone()
+    self.events.notify()
+    if not hold:
+      self.delivery_cv_notify()
+    return {'principal': self.agent_view(updated)}
+
+  def set_host_alias(self, host, display_name):
+    host = _clip(host, 120)
+    if not host:
+      raise ApiError(422, 'bad_host', 'host is required')
+    alias = _clip(display_name, 80)
+    now = self.now()
+    with self.db.tx() as c:
+      if alias and alias != host:
+        c.execute("""INSERT INTO host_aliases VALUES (?, ?, ?) ON CONFLICT(host)
+            DO UPDATE SET display_name=excluded.display_name, updated_at=excluded.updated_at""",
+                  (host, alias, now))
+      else:
+        c.execute('DELETE FROM host_aliases WHERE host=?', (host,))
+        alias = None
+      self.events.append(c, 'host', host=host, display_name=alias or host)
+    self.events.notify()
+    return {'host': host, 'display_name': alias or host}
 
   def recipient_supports_images(self, pid):
     return self.presence_view(pid)['capabilities']['images']

@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS principals (
   status TEXT NOT NULL,            -- admitted | revoked
   role TEXT,                       -- NULL | consul (single active holder)
   pool_id INTEGER,
+  hold_reason TEXT,
+  hold_since REAL,
   created_at REAL NOT NULL,
   admitted_at REAL,
   revoked_at REAL
@@ -102,7 +104,12 @@ CREATE TABLE IF NOT EXISTS presence (
   capabilities TEXT,
   host_metrics TEXT,
   last_checkin_at REAL,
-  online INTEGER NOT NULL DEFAULT 0
+  online INTEGER NOT NULL DEFAULT 0,
+  activity_state TEXT,
+  activity_since REAL,
+  last_activity_at REAL,
+  turn_started_at REAL,
+  derived_status TEXT
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -136,9 +143,11 @@ CREATE TABLE IF NOT EXISTS messages (
   lease_id TEXT,
   lease_until REAL,
   client_msg_id TEXT,
+  client_sent_at REAL,
   created_at REAL NOT NULL,
   delivered_at REAL,
   failed_at REAL,
+  cancelled_at REAL,
   UNIQUE (sender_id, client_msg_id)
 );
 CREATE INDEX IF NOT EXISTS ix_messages_queue ON messages(recipient_id, state, priority DESC, created_at);
@@ -228,6 +237,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT NOT NULL DEFAULT 'open',
   priority INTEGER NOT NULL DEFAULT 0,
   created_by_principal_id INTEGER REFERENCES principals(id),
+  version INTEGER NOT NULL DEFAULT 1,
+  status_changed_at REAL,
+  started_at REAL,
+  completed_at REAL,
+  blocked_reason TEXT,
   created_at REAL NOT NULL,
   updated_at REAL NOT NULL
 );
@@ -237,4 +251,9 @@ CREATE TABLE IF NOT EXISTS task_assignees (
   principal_id INTEGER NOT NULL REFERENCES principals(id),
   assigned_at REAL NOT NULL,
   PRIMARY KEY (task_id, principal_id)
+);
+CREATE TABLE IF NOT EXISTS host_aliases (
+  host TEXT PRIMARY KEY,
+  display_name TEXT NOT NULL,
+  updated_at REAL NOT NULL
 );

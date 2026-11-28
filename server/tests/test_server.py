@@ -848,11 +848,15 @@ class StageOneTests(ServerCase):
   def test_effective_status_progress_staleness_and_sweeper(self):
     o = self.owner()
     a = self.agent(o, 'derived')
-    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'idle')
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'unknown')
     self.clock.advance(self.settings.checkin_ttl_sec + 1)
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'offline')
     self.checkin(a, status={'busy': False})
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'idle')
+    self.checkin(a, status={'busy': False, 'attached': False})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'detached')
+    self.checkin(a, status={'busy': False, 'attached': True, 'activity': {'state': 'waiting_input', 'since': self.clock()}})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'needs_input')
     self.checkin(a, status={'busy': True})
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'working')
     self.checkin(a, status={'busy': False})
@@ -862,10 +866,17 @@ class StageOneTests(ServerCase):
     self.assertFalse(p1['stale'])
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'working')
     self.clock.advance(self.settings.progress_stale_sec + 1)
-    self.checkin(a, status={'busy': False})
+    # Active activity prevents false stale; without newer activity it turns stale, then stalled at stall_sec.
+    self.checkin(a, status={'busy': True, 'activity': {'state': 'busy', 'last_activity_at': self.clock()}})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'working')
+    self.clock.advance(self.settings.progress_stale_sec + 1)
+    self.checkin(a, status={'busy': True, 'activity': {'state': 'busy', 'last_activity_at': self.clock() - self.settings.progress_stale_sec - 1}})
     p1_stale = self.app.message_view(m1['id'])['progress']
     self.assertTrue(p1_stale['stale'])
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'stale')
+    self.clock.advance(self.settings.stall_sec)
+    self.checkin(a, status={'busy': True, 'activity': {'state': 'busy', 'last_activity_at': self.clock() - self.settings.stall_sec - 5}})
+    self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'stalled')
     # Offline agent progress is reaped cleanly by sweep_once
     before_off = self.app.events.latest_id()
     self.clock.advance(self.settings.checkin_ttl_sec + 1)
@@ -875,7 +886,7 @@ class StageOneTests(ServerCase):
     self.assertEqual(self.app.presence_view(a.pid)['effective_status'], 'offline')
     self.assertEqual([e['payload']['phase'] for e in self.app.events.since(before_off)
                       if e['type'] == 'message_progress'], ['done'])
-    # Online agent progress exceeding progress_ttl_sec is also reaped cleanly
+    # Online agent progress exceeding progress_ttl_sec is also reaped cleanly (except input_required)
     self.checkin(a, status={'busy': False})
     m2 = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'ttl check'})['message']
     self.api(a, 'PUT', f"messages/{m2['id']}/progress", {'phase': 'working'})
@@ -888,6 +899,77 @@ class StageOneTests(ServerCase):
     self.assertIsNone(self.app.message_view(m2['id'])['progress'])
     self.assertEqual([e['payload']['phase'] for e in self.app.events.since(before_ttl)
                       if e['type'] == 'message_progress'], ['done'])
+
+  def test_stage3_cancel_hold_conflict_lifecycle_storage_host_aliases_and_tasks(self):
+    o = self.owner()
+    a = self.agent(o, 'worker3')
+    self.checkin(a, host='TestHost', status={'busy': False})
+    # Avatar image support & /static/avatars/ serving
+    self.api(o, 'PATCH', f'admin/principals/{a.pid}', {'avatar': {'image': '/static/avatars/gem.png', 'icon': 'gem', 'color': '#2563EB'}})
+    self.api(o, 'PATCH', f'admin/principals/{a.pid}', {'avatar': {'image': '/static/avatars/../bad.png'}}, 422)
+    with urllib.request.urlopen(self.base + '/static/avatars/gem.png') as resp:
+      self.assertEqual(resp.status, 200)
+      self.assertEqual(resp.headers.get('Cache-Control'), 'public, max-age=86400')
+    # client_msg_id conflict vs idempotent duplicate
+    t0 = self.clock() - 0.1
+    m_wait = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'queued job', 'client_msg_id': 'cm1', 'client_sent_at': t0})['message']
+    dup = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'queued job', 'client_msg_id': 'cm1'})
+    self.assertTrue(dup['duplicate'])
+    self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'different body', 'client_msg_id': 'cm1'}, 409)
+    # Hold / unhold
+    held = self.api(o, 'POST', f'admin/principals/{a.pid}/hold', {'reason': 'maintenance'})['principal']
+    self.assertEqual(held['hold']['reason'], 'maintenance')
+    self.assertEqual(self.claim(a)['reason'], 'held')
+    resumed = self.api(o, 'DELETE', f'admin/principals/{a.pid}/hold')['principal']
+    self.assertIsNone(resumed['hold'])
+    # Cancel queued vs claimed message
+    c_res = self.api(o, 'POST', f"messages/{m_wait['id']}/cancel", {'reason': 'never mind'})['message']
+    self.assertEqual(c_res['state'], 'cancelled')
+    self.api(o, 'POST', f"messages/{m_wait['id']}/cancel", {}, 409)
+    # Full lifecycle latency breakdown
+    m_live = self.api(o, 'POST', 'messages', {'to': a.pid, 'body': 'measure me', 'client_sent_at': self.clock() - 0.2})['message']
+    self.clock.advance(0.5)
+    got = self.claim(a)
+    self.clock.advance(0.3)
+    self.api(a, 'POST', f"deliveries/{got['lease_id']}/delivered")
+    self.clock.advance(1.2)
+    rep = self.api(a, 'POST', f"messages/{m_live['id']}/reply", {'body': 'measured reply'})['message']
+    lc = self.api(o, 'GET', f"messages/{m_live['id']}/lifecycle")
+    self.assertEqual(lc['reply_message_id'], rep['id'])
+    self.assertGreaterEqual(lc['durations_ms']['server_to_claim'], 500)
+    self.assertGreaterEqual(lc['durations_ms']['agent_think_to_reply'], 1200)
+    self.assertEqual(len(lc['attempts']), 1)
+    # Host alias rename & clear
+    al = self.api(o, 'PUT', 'admin/hosts/TestHost', {'display_name': 'Mini Staging'})
+    self.assertEqual(al['display_name'], 'Mini Staging')
+    self.assertEqual(next(h['display_name'] for h in self.api(o, 'GET', 'board')['hosts'] if h['host'] == 'TestHost'), 'Mini Staging')
+    self.api(o, 'PUT', 'admin/hosts/TestHost', {'display_name': ''})
+    self.assertEqual(next(h['display_name'] for h in self.api(o, 'GET', 'board')['hosts'] if h['host'] == 'TestHost'), 'TestHost')
+    # Storage view & cleanup
+    st = self.api(o, 'GET', 'admin/storage')['storage']
+    self.assertEqual(st['quota_gb'], 10.0)
+    self.assertGreater(st['db_bytes'], 0)
+    cl = self.api(o, 'POST', 'admin/cleanup', {'action': 'all'})
+    self.assertTrue(cl['cleaned']['wal_checkpointed'])
+    # Tasks: cancelled state, blocked_reason, version CAS, task_counts
+    proj = self.api(o, 'POST', 'projects', {'name': 'V5 Proj', 'member_ids': [a.pid]})['project']
+    task = self.api(o, 'POST', f"projects/{proj['id']}/tasks", {'title': 'T1', 'assignee_ids': [a.pid]})['task']
+    self.assertEqual(task['version'], 1)
+    t_blk = self.api(o, 'PATCH', f"tasks/{task['id']}", {'status': 'blocked', 'blocked_reason': 'waiting hardware', 'expected_version': 1})['task']
+    self.assertEqual((t_blk['version'], t_blk['blocked_reason']), (2, 'waiting hardware'))
+    self.api(o, 'PATCH', f"tasks/{task['id']}", {'status': 'cancelled', 'expected_version': 1}, 409)
+    t_can = self.api(o, 'PATCH', f"tasks/{task['id']}", {'status': 'cancelled', 'expected_version': 2})['task']
+    self.assertEqual(t_can['status'], 'cancelled')
+    self.assertIsNotNone(t_can['completed_at'])
+    p_view = next(p for p in self.api(o, 'GET', 'projects')['projects'] if p['id'] == proj['id'])
+    self.assertEqual(p_view['task_counts']['cancelled'], 1)
+    # Conversation messages include last_event_id
+    self.assertIn('last_event_id', self.api(o, 'GET', f"conversations/{m_live['conversation_id']}/messages"))
+    # SSE reset event when Last-Event-ID is ahead
+    with o.opener.open(f"{self.base}/api/v1/events?last=9999999", timeout=5) as sse:
+      chunk = b''.join(sse.readline() for _ in range(5)).decode('utf-8')
+      self.assertIn('event: reset', chunk)
+      self.assertIn('"reason": "ahead"', chunk)
 
   def test_v4_backup_and_restore(self):
     o = self.owner()
@@ -1281,13 +1363,15 @@ class SenateAndConsulTests(ServerCase):
     db = Database(db_path)
     try:
       ver = db.one("SELECT value FROM meta WHERE key='schema_version'")[0]
-      self.assertEqual(int(ver), 4)
-      self.assertEqual(SCHEMA_VERSION, 4)
+      self.assertEqual(int(ver), 5)
+      self.assertEqual(SCHEMA_VERSION, 5)
       self.assertIn('capabilities', [r['name'] for r in db.all('PRAGMA table_info(presence)')])
+      self.assertIn('derived_status', [r['name'] for r in db.all('PRAGMA table_info(presence)')])
+      self.assertIn('hold_reason', [r['name'] for r in db.all('PRAGMA table_info(principals)')])
       self.assertEqual(db.one('SELECT host FROM presence')[0], 'original')
       self.assertEqual(db.one('SELECT body FROM messages WHERE id=12')[0], 'original message')
       self.assertEqual(tuple(db.one('SELECT pinned,pinned_at FROM conversations')), (0, None))
-      for table in ('conversation_reads', 'message_progress', 'projects', 'project_members', 'tasks', 'task_assignees'):
+      for table in ('conversation_reads', 'message_progress', 'projects', 'project_members', 'tasks', 'task_assignees', 'host_aliases'):
         self.assertEqual(db.all(f'SELECT * FROM {table}'), [])
       if version == 3:
         self.assertEqual(tuple(db.one('SELECT * FROM message_attachments')), (12, 9, 0))

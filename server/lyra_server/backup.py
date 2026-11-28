@@ -15,7 +15,7 @@ import sqlite3
 TABLES = ('users', 'principals', 'credentials', 'invites', 'pools', 'presence', 'conversations',
           'conversation_members', 'messages', 'delivery_attempts', 'reactions', 'events',
           'attachments', 'message_attachments', 'conversation_reads', 'message_progress',
-          'projects', 'project_members', 'tasks', 'task_assignees')
+          'projects', 'project_members', 'tasks', 'task_assignees', 'host_aliases')
 
 
 def row_counts(path):

@@ -19,4 +19,4 @@ packages = ["lyra_server", "lyra_server.static"]
 
 [tool.setuptools.package-data]
 lyra_server = ["schema.sql"]
-"lyra_server.static" = ["*.html", "*.js", "*.css", "vendor/katex/LICENSE", "vendor/katex/*.css", "vendor/katex/*.js", "vendor/katex/fonts/*.woff2"]
+"lyra_server.static" = ["*.html", "*.js", "*.css", "avatars/*", "vendor/katex/LICENSE", "vendor/katex/*.css", "vendor/katex/*.js", "vendor/katex/fonts/*.woff2"]

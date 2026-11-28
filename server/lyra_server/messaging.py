@@ -2,6 +2,7 @@
 # messaging.py: Conversations, messages, reactions, and the delivery queue.
 # =============================================================================
 
+import math
 import secrets
 import threading
 import time
@@ -12,7 +13,7 @@ from .events import ApiError
 
 
 PRIORITY = {'queue': 0, 'jump': 1}
-FINAL_STATES = ('delivered', 'failed')
+FINAL_STATES = ('delivered', 'failed', 'cancelled')
 
 
 def valid_emoji(emoji):
@@ -28,6 +29,7 @@ class MessagingMixin:
 
   def _init_messaging(self):
     self.delivery_cv = threading.Condition()
+    self._progress_emit_at = {}
 
   def delivery_cv_notify(self):
     with self.delivery_cv:
@@ -71,7 +73,7 @@ class MessagingMixin:
   # --- send and reply ------------------------------------------------------
 
   def send(self, sender, to, body, mode=None, client_msg_id=None, reply_to_id=None,
-           attachment_ids=None):
+           attachment_ids=None, client_sent_at=None):
     """Sender always comes from the credential, never from the request body."""
     body = str(body or '')
     ids = self.validate_attachment_ids(attachment_ids)
@@ -80,13 +82,10 @@ class MessagingMixin:
     if len(body) > self.settings.max_message_chars:
       raise ApiError(413, 'body_too_long', 'message is too long')
     client_msg_id = (str(client_msg_id)[:64] if client_msg_id else None)
+    cs_at = (float(client_sent_at) if type(client_sent_at) in (int, float)
+             and math.isfinite(client_sent_at) and client_sent_at > 0 else None)
     now = self.now()
     with self.db.tx() as c:
-      if client_msg_id:
-        dup = c.execute('SELECT id FROM messages WHERE sender_id=? AND client_msg_id=?',
-                        (sender['id'], client_msg_id)).fetchone()
-        if dup:
-          return {'message': self.message_view(dup['id'], c=c), 'duplicate': True}
       if reply_to_id is not None:
         orig = c.execute('SELECT * FROM messages WHERE id=?', (reply_to_id,)).fetchone()
         if not orig:
@@ -110,6 +109,14 @@ class MessagingMixin:
         conv = self._conversation_for(c, sender, recipient, now)
       if sender['kind'] == 'owner' and conv['kind'] == 'agent_agent':
         raise ApiError(403, 'read_only', 'agent-to-agent conversations are read-only for the owner')
+      if client_msg_id:
+        dup = c.execute('SELECT * FROM messages WHERE sender_id=? AND client_msg_id=?',
+                        (sender['id'], client_msg_id)).fetchone()
+        if dup:
+          if dup['body'] != body or dup['recipient_id'] != recipient['id'] or dup['reply_to_id'] != reply_to_id:
+            raise ApiError(409, 'client_msg_id_conflict',
+                           'client_msg_id already used with different message content')
+          return {'message': self.message_view(dup['id'], c=c), 'duplicate': True}
 
       # i. Mode must be one the recipient currently advertises.
       mode = (mode or 'queue').lower()
@@ -138,10 +145,10 @@ class MessagingMixin:
       to_owner = recipient['kind'] == 'owner'
       cur = c.execute(
         'INSERT INTO messages(conversation_id, sender_id, recipient_id, body, reply_to_id, mode, '
-        'priority, state, client_msg_id, created_at, delivered_at) '
-        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'priority, state, client_msg_id, client_sent_at, created_at, delivered_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (conv['id'], sender['id'], recipient['id'], body, reply_to_id, mode, PRIORITY[mode],
-         'delivered' if to_owner else 'waiting', client_msg_id, now, now if to_owner else None),
+         'delivered' if to_owner else 'waiting', client_msg_id, cs_at, now, now if to_owner else None),
       )
       self.bind_attachments(c, ids, cur.lastrowid, sender['id'])
       if sender['kind'] == 'agent' and (reply_to_id is not None or to_owner):
@@ -159,13 +166,15 @@ class MessagingMixin:
       self.delivery_cv_notify()
     return {'message': view, 'duplicate': False}
 
-  def reply(self, sender, message_id, body, mode=None, client_msg_id=None, attachment_ids=None):
+  def reply(self, sender, message_id, body, mode=None, client_msg_id=None, attachment_ids=None,
+            client_sent_at=None):
     return self.send(sender, None, body, mode=mode, client_msg_id=client_msg_id,
-                     reply_to_id=int(message_id), attachment_ids=attachment_ids)
+                     reply_to_id=int(message_id), attachment_ids=attachment_ids,
+                     client_sent_at=client_sent_at)
 
   def set_progress(self, actor, mid, data):
     phase = data.get('phase')
-    if phase not in ('thinking', 'working', 'done'):
+    if phase not in ('thinking', 'working', 'input_required', 'done'):
       raise ApiError(422, 'bad_progress', 'unknown progress phase')
     summary = data.get('summary')
     if summary is not None and not isinstance(summary, str):
@@ -183,17 +192,24 @@ class MessagingMixin:
         cleaned.append({'text': b['text'][:200], 'state': b['state']})
       bullets = cleaned
     now = self.now()
+    emit = False
     with self.db.tx() as c:
       m = c.execute('SELECT recipient_id, conversation_id FROM messages WHERE id=?', (mid,)).fetchone()
       if not m:
         raise ApiError(404, 'no_message', 'unknown message')
       if m['recipient_id'] != actor['id']:
         raise ApiError(403, 'not_recipient', 'only the recipient can update progress')
+      prev = c.execute('SELECT phase FROM message_progress WHERE message_id=?', (mid,)).fetchone()
       c.execute("""INSERT INTO message_progress VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO UPDATE SET
           phase=excluded.phase, summary=excluded.summary, bullets=excluded.bullets, updated_at=excluded.updated_at""",
                 (mid, phase, summary, dumps(bullets) if bullets is not None else None, now))
-      self.events.append(c, 'message_progress', id=mid, conversation_id=m['conversation_id'], phase=phase)
-    self.events.notify()
+      last_emit = self._progress_emit_at.get(mid, 0.0)
+      if prev is None or prev['phase'] != phase or (now - last_emit) >= 2.0:
+        self.events.append(c, 'message_progress', id=mid, conversation_id=m['conversation_id'], phase=phase)
+        self._progress_emit_at[mid] = now
+        emit = True
+    if emit:
+      self.events.notify()
     return {'ok': True, 'progress': {'phase': phase, 'summary': summary, 'bullets': bullets,
                                      'updated_at': now, 'stale': False}}
 
@@ -295,8 +311,9 @@ class MessagingMixin:
       'attachments': self.message_attachments(mid),
       'body': m['body'], 'reply_to': reply_to, 'mode': m['mode'], 'state': m['state'],
       'state_reason': m['state_reason'], 'attempts': m['attempts'], 'retry': bool(m['retry']),
-      'created_at': m['created_at'], 'delivered_at': m['delivered_at'],
-      'failed_at': m['failed_at'], 'reactions': self._reactions(m['id'], c=c),
+      'client_sent_at': m['client_sent_at'], 'created_at': m['created_at'],
+      'delivered_at': m['delivered_at'], 'failed_at': m['failed_at'],
+      'cancelled_at': m['cancelled_at'], 'reactions': self._reactions(m['id'], c=c),
       'queue_position': self._queue_position(m, c) if m['state'] == 'waiting' else None,
     }
 
@@ -416,23 +433,95 @@ class MessagingMixin:
                 'message': view}
 
   def claim(self, agent, wait=25.0):
-    """Long-poll for the next deliverable message; returns None on timeout."""
+    """Long-poll for the next deliverable message; returns reason empty/held on miss."""
     deadline = time.monotonic() + max(0.0, min(float(wait), 55.0))
     while True:
-      if not self.principal_for_id_active(agent['id']):
+      p = self.principal_for_id_active(agent['id'])
+      if not p:
         raise ApiError(401, 'revoked', 'credential is no longer valid')
+      if p['hold_since'] is not None:
+        return {'lease_id': None, 'message': None, 'reason': 'held', 'retry_after_ms': 5000}
       got = self._try_claim(agent)
       if got:
         self.events.notify()
         return got
       left = deadline - time.monotonic()
       if left <= 0:
-        return None
+        return {'lease_id': None, 'message': None, 'reason': 'empty'}
       with self.delivery_cv:
         self.delivery_cv.wait(min(left, 5.0))
 
   def principal_for_id_active(self, pid):
-    return self.db.one("SELECT 1 FROM principals WHERE id=? AND status='admitted'", (pid,))
+    return self.db.one("SELECT * FROM principals WHERE id=? AND status='admitted'", (pid,))
+
+  def cancel_message(self, actor, mid, reason=None, admin=False):
+    now = self.now()
+    clean_reason = _clip_reason(reason) or 'cancelled by sender'
+    with self.db.tx() as c:
+      m = c.execute('SELECT * FROM messages WHERE id=?', (mid,)).fetchone()
+      if not m:
+        raise ApiError(404, 'no_message', 'unknown message')
+      if not admin and m['sender_id'] != actor['id']:
+        raise ApiError(403, 'not_sender', 'only the sender or administrator can cancel this message')
+      cur = c.execute(
+        "UPDATE messages SET state='cancelled', state_reason=?, cancelled_at=?, lease_id=NULL, "
+        "lease_until=NULL WHERE id=? AND state='waiting' AND (lease_until IS NULL OR lease_until < ?)",
+        (clean_reason, now, mid, now),
+      )
+      if cur.rowcount == 0:
+        raise ApiError(409, 'message_claimed', 'message has already been claimed or finished', state=m['state'])
+      self.events.append(c, 'message_state', id=mid, state='cancelled', reason=clean_reason,
+                         conversation_id=m['conversation_id'])
+    self.events.notify()
+    return {'message': self.message_view(mid)}
+
+  def message_lifecycle(self, viewer, mid, admin=False):
+    with self.db.lock:
+      c = self.db.conn
+      m = c.execute('SELECT * FROM messages WHERE id=?', (mid,)).fetchone()
+      if not m:
+        raise ApiError(404, 'no_message', 'unknown message')
+      if not admin and not self._is_member(c, m['conversation_id'], viewer['id']):
+        raise ApiError(403, 'not_member', 'you are not in this conversation')
+      attempts = c.execute('SELECT lease_id, claimed_at, lease_until, outcome, outcome_at '
+                           'FROM delivery_attempts WHERE message_id=? ORDER BY id', (mid,)).fetchall()
+      prog = c.execute('SELECT phase, summary, bullets, updated_at FROM message_progress WHERE message_id=?',
+                       (mid,)).fetchone()
+      reply = c.execute(
+        'SELECT id, created_at, delivered_at FROM messages WHERE conversation_id=? AND id>? '
+        'AND (reply_to_id=? OR sender_id=?) ORDER BY id LIMIT 1',
+        (m['conversation_id'], mid, mid, m['recipient_id']),
+      ).fetchone()
+    def _ms(start, end):
+      if start is None or end is None:
+        return None
+      return round(max(0.0, (end - start) * 1000.0))
+    first_claim = attempts[0]['claimed_at'] if attempts else None
+    last_claim = attempts[-1]['claimed_at'] if attempts else None
+    reply_at = reply['created_at'] if reply else None
+    return {
+      'message_id': mid,
+      'state': m['state'],
+      'client_sent_at': m['client_sent_at'],
+      'server_received_at': m['created_at'],
+      'first_claimed_at': first_claim,
+      'agent_read_at': m['delivered_at'],
+      'progress_phase': prog['phase'] if prog else None,
+      'progress_updated_at': prog['updated_at'] if prog else None,
+      'replied_at': reply_at,
+      'reply_message_id': reply['id'] if reply else None,
+      'cancelled_at': m['cancelled_at'],
+      'failed_at': m['failed_at'],
+      'durations_ms': {
+        'client_to_server': _ms(m['client_sent_at'], m['created_at']),
+        'server_to_claim': _ms(m['created_at'], first_claim),
+        'claim_to_agent_read': _ms(last_claim, m['delivered_at']),
+        'server_to_agent_read': _ms(m['created_at'], m['delivered_at']),
+        'agent_think_to_reply': _ms(m['delivered_at'] or m['created_at'], reply_at),
+        'total_round_trip': _ms(m['created_at'], reply_at),
+      },
+      'attempts': [dict(a) for a in attempts],
+    }
 
   def ack(self, agent, lease_id, outcome, reason=None):
     """Record a handoff outcome; stale leases cannot close a newer attempt."""
@@ -514,7 +603,8 @@ class MessagingMixin:
       JOIN messages m ON m.id = mp.message_id
       LEFT JOIN presence pr ON pr.principal_id = m.recipient_id
       WHERE mp.phase != 'done'
-        AND (mp.updated_at < ? OR pr.principal_id IS NULL OR pr.online = 0
+        AND ((mp.phase != 'input_required' AND mp.updated_at < ?)
+             OR pr.principal_id IS NULL OR pr.online = 0
              OR pr.last_checkin_at IS NULL OR pr.last_checkin_at < ?)
     """, (progress_cutoff, checkin_cutoff)).fetchall()
     for r in rows:

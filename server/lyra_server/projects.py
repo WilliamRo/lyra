@@ -8,7 +8,7 @@ from .events import ApiError
 
 
 PROJECT_STATES = ('active', 'paused', 'completed', 'archived')
-TASK_STATES = ('open', 'in_progress', 'in_review', 'blocked', 'done')
+TASK_STATES = ('open', 'in_progress', 'in_review', 'blocked', 'done', 'cancelled')
 
 
 def _text(value, field, required=False):
@@ -58,7 +58,11 @@ class ProjectsMixin:
         pm = next((p for p in members if p['id'] == project['pm_principal_id']), None)
         tasks = [{**dict(t), 'assignees': _principals(c, 'task_assignees', 'task_id', t['id'])}
                  for t in c.execute('SELECT * FROM tasks WHERE project_id=? ORDER BY id', (pid,))]
-        result.append({**dict(project), 'members': members, 'tasks': tasks,
+        counts = {'total': len(tasks), **{s: 0 for s in TASK_STATES}}
+        for t in tasks:
+          if t['status'] in counts:
+            counts[t['status']] += 1
+        result.append({**dict(project), 'members': members, 'tasks': tasks, 'task_counts': counts,
                        'pm': {k: pm[k] for k in ('id', 'handle', 'display_name', 'avatar')} if pm else None})
       return result
 
@@ -92,12 +96,12 @@ class ProjectsMixin:
       c.executemany('DELETE FROM project_members WHERE project_id=? AND principal_id=?',
                     ((pid, person) for person in removed))
       # Validate the final set even when one update removes several co-assignees.
-      if c.execute("""SELECT 1 FROM tasks t WHERE project_id=? AND status!='done' AND NOT EXISTS
+      if c.execute("""SELECT 1 FROM tasks t WHERE project_id=? AND status NOT IN ('done','cancelled') AND NOT EXISTS
           (SELECT 1 FROM task_assignees a JOIN project_members m ON m.principal_id=a.principal_id
            WHERE a.task_id=t.id AND m.project_id=t.project_id) LIMIT 1""", (pid,)).fetchone():
         raise ApiError(409, 'member_has_sole_task', 'reassign unfinished tasks before removing members')
       c.executemany("""DELETE FROM task_assignees WHERE principal_id=? AND task_id IN
-          (SELECT id FROM tasks WHERE project_id=? AND status!='done')""", ((p, pid) for p in removed))
+          (SELECT id FROM tasks WHERE project_id=? AND status NOT IN ('done','cancelled'))""", ((p, pid) for p in removed))
     c.execute("UPDATE project_members SET role=CASE WHEN principal_id=? THEN 'pm' ELSE 'member' END "
               'WHERE project_id=?', (pm, pid))
 
@@ -149,10 +153,25 @@ class ProjectsMixin:
       if not project:
         raise ApiError(404, 'no_project', 'unknown project')
       self._project_access(c, actor, admin, project, 'edit_task' if old else 'create_task', tid)
+      if old and 'expected_version' in data:
+        ev = data['expected_version']
+        if type(ev) is not int:
+          raise ApiError(422, 'bad_version', 'expected_version must be an integer')
+        if ev != old['version']:
+          raise ApiError(409, 'version_conflict', 'task was modified concurrently',
+                         current_version=old['version'])
       fields = {**(dict(old) if old else {}), **data}
       title = _text(fields.get('title'), 'title', required=True)
       description = _text(fields.get('description'), 'description')
       status = _state(fields.get('status', 'open'), TASK_STATES)
+      raw_reason = data['blocked_reason'] if 'blocked_reason' in data else data.get('reason')
+      if 'blocked_reason' in data or 'reason' in data:
+        blocked_reason = _text(raw_reason, 'blocked_reason')
+        blocked_reason = blocked_reason[:400] if blocked_reason else None
+      elif status != 'blocked':
+        blocked_reason = None
+      else:
+        blocked_reason = old['blocked_reason'] if old else None
       priority = fields.get('priority', 0)
       if type(priority) is not int or not -(2**63) <= priority < 2**63:
         raise ApiError(422, 'bad_priority', 'priority must be an integer')
@@ -162,12 +181,26 @@ class ProjectsMixin:
       if not assignees or not assignees <= members:
         raise ApiError(422, 'bad_assignees', 'assign at least one current project member')
       if old:
-        c.execute('UPDATE tasks SET title=?, description=?, status=?, priority=?, updated_at=? WHERE id=?',
-                  (title, description, status, priority, now, tid))
+        status_changed = old['status'] != status
+        status_changed_at = now if status_changed else old['status_changed_at']
+        started_at = old['started_at'] or (now if status == 'in_progress' else None)
+        if status in ('done', 'cancelled'):
+          completed_at = old['completed_at'] or now
+        else:
+          completed_at = None
+        c.execute('UPDATE tasks SET title=?, description=?, status=?, priority=?, blocked_reason=?, '
+                  'status_changed_at=?, started_at=?, completed_at=?, version=version+1, updated_at=? WHERE id=?',
+                  (title, description, status, priority, blocked_reason,
+                   status_changed_at, started_at, completed_at, now, tid))
       else:
+        status_changed_at = now
+        started_at = now if status == 'in_progress' else None
+        completed_at = now if status in ('done', 'cancelled') else None
         tid = c.execute('INSERT INTO tasks(project_id,title,description,status,priority,created_by_principal_id,'
-                        'created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)',
-                        (pid, title, description, status, priority, actor['id'], now, now)).lastrowid
+                        'version,status_changed_at,started_at,completed_at,blocked_reason,created_at,updated_at) '
+                        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (pid, title, description, status, priority, actor['id'],
+                         1, status_changed_at, started_at, completed_at, blocked_reason, now, now)).lastrowid
       c.executemany('DELETE FROM task_assignees WHERE task_id=? AND principal_id=?',
                     ((tid, p) for p in current - assignees))
       c.executemany('INSERT INTO task_assignees VALUES (?, ?, ?)', ((tid, p, now) for p in assignees - current))

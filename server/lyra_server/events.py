@@ -43,6 +43,10 @@ class EventLog:
     row = self.db.one('SELECT MAX(id) FROM events')
     return int(row[0] or 0)
 
+  def oldest_id(self):
+    row = self.db.one('SELECT MIN(id) FROM events')
+    return int(row[0]) if row and row[0] is not None else None
+
   def since(self, last_id, limit=200):
     rows = self.db.all(
       'SELECT id, ts, type, payload FROM events WHERE id > ? ORDER BY id LIMIT ?',

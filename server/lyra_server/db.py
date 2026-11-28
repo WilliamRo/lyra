@@ -11,7 +11,7 @@ import sqlite3
 import threading
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _schema_sql():
@@ -87,6 +87,35 @@ class Database:
           'ALTER TABLE conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;'
           'ALTER TABLE conversations ADD COLUMN pinned_at REAL;' + _schema_sql() +
           "UPDATE meta SET value='4' WHERE key='schema_version'; COMMIT;"
+        )
+        v = 4
+      if v == 4:
+        v5_cols = (
+          ('principals', 'hold_reason', 'TEXT'),
+          ('principals', 'hold_since', 'REAL'),
+          ('presence', 'activity_state', 'TEXT'),
+          ('presence', 'activity_since', 'REAL'),
+          ('presence', 'last_activity_at', 'REAL'),
+          ('presence', 'turn_started_at', 'REAL'),
+          ('presence', 'derived_status', 'TEXT'),
+          ('messages', 'client_sent_at', 'REAL'),
+          ('messages', 'cancelled_at', 'REAL'),
+          ('tasks', 'version', 'INTEGER NOT NULL DEFAULT 1'),
+          ('tasks', 'status_changed_at', 'REAL'),
+          ('tasks', 'started_at', 'REAL'),
+          ('tasks', 'completed_at', 'REAL'),
+          ('tasks', 'blocked_reason', 'TEXT'),
+        )
+        stmts = []
+        cols_by_table = {}
+        for tbl, col, ddl in v5_cols:
+          if tbl not in cols_by_table:
+            cols_by_table[tbl] = {r[1] for r in self.conn.execute(f'PRAGMA table_info({tbl})')}
+          if col not in cols_by_table[tbl]:
+            stmts.append(f'ALTER TABLE {tbl} ADD COLUMN {col} {ddl};')
+        self.conn.executescript(
+          'BEGIN;' + ''.join(stmts) + _schema_sql() +
+          "UPDATE meta SET value='5' WHERE key='schema_version'; COMMIT;"
         )
       elif v > SCHEMA_VERSION:
         raise RuntimeError(f'database schema {v} is newer than this server ({SCHEMA_VERSION})')

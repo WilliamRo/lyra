@@ -93,7 +93,9 @@ class Settings:
   checkin_interval_sec: int = 15
   checkin_ttl_sec: int = 45
   progress_stale_sec: int = 120
+  stall_sec: int = 600
   progress_ttl_sec: int = 1800
+  storage_quota_gb: float = 10.0
   message_ttl_sec: int = 86400
   lease_sec: int = 30
   max_attempts: int = 5
@@ -153,12 +155,15 @@ class Settings:
 
 
 _INT_FIELDS = {f.name for f in fields(Settings) if f.type in (int, 'int')}
+_FLOAT_FIELDS = {f.name for f in fields(Settings) if f.type in (float, 'float')}
 _BOOL_FIELDS = {f.name for f in fields(Settings) if f.type in (bool, 'bool')}
 
 
 def _coerce(name, value):
   if name in _INT_FIELDS:
     return int(value)
+  if name in _FLOAT_FIELDS:
+    return float(value)
   if name in _BOOL_FIELDS:
     return value if isinstance(value, bool) else _bool(value)
   return str(value)

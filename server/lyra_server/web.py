@@ -163,6 +163,36 @@ def h_retry(ctx, mid):
   return ctx.app.retry(int(mid))
 
 
+@route('POST', r'/api/v1/admin/principals/(\d+)/hold', ADMIN)
+def h_hold(ctx, pid):
+  return ctx.app.hold_principal(int(pid), True, reason=ctx.body().get('reason'))
+
+
+@route('DELETE', r'/api/v1/admin/principals/(\d+)/hold', ADMIN)
+def h_unhold(ctx, pid):
+  return ctx.app.hold_principal(int(pid), False)
+
+
+@route('PUT', r'/api/v1/admin/hosts/([^/]+)', ADMIN)
+def h_host_alias(ctx, host):
+  return ctx.app.set_host_alias(unquote(host), ctx.body().get('display_name'))
+
+
+@route('GET', r'/api/v1/admin/storage', ADMIN)
+def h_storage(ctx):
+  return {'storage': ctx.app.storage_view()}
+
+
+@route('POST', r'/api/v1/admin/cleanup', ADMIN)
+def h_cleanup(ctx):
+  b = ctx.body()
+  return ctx.app.cleanup_storage(
+    action=b.get('action') or 'all',
+    keep_backups=_int(b.get('keep_backups')) or 5,
+    event_days=_int(b.get('event_days')) or 7,
+  )
+
+
 @route('GET', r'/api/v1/projects', EITHER)
 def h_projects(ctx):
   return {'projects': ctx.app.projects_view()}
@@ -216,9 +246,11 @@ def h_convs(ctx):
 @route('GET', r'/api/v1/conversations/(\d+)/messages', EITHER)
 def h_conv_msgs(ctx, cid):
   q = ctx.query()
-  return ctx.app.conversation_messages(ctx.principal, int(cid), after=_int(q.get('after')) or 0,
-                                       limit=_int(q.get('limit')) or 200,
-                                       include_all=ctx.is_admin)
+  out = ctx.app.conversation_messages(ctx.principal, int(cid), after=_int(q.get('after')) or 0,
+                                        limit=_int(q.get('limit')) or 200,
+                                        include_all=ctx.is_admin)
+  out['last_event_id'] = ctx.app.events.latest_id()
+  return out
 
 
 @route('POST', r'/api/v1/attachments', EITHER)
@@ -243,14 +275,26 @@ def h_image(ctx, aid):
 def h_send(ctx):
   b = ctx.body()
   return ctx.app.send(ctx.principal, b.get('to'), b.get('body'), mode=b.get('mode'),
-                      client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'))
+                      client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'),
+                      client_sent_at=b.get('client_sent_at'))
 
 
 @route('POST', r'/api/v1/messages/(\d+)/reply', EITHER)
 def h_reply(ctx, mid):
   b = ctx.body()
   return ctx.app.reply(ctx.principal, int(mid), b.get('body'), mode=b.get('mode'),
-                       client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'))
+                       client_msg_id=b.get('client_msg_id'), attachment_ids=b.get('attachment_ids'),
+                       client_sent_at=b.get('client_sent_at'))
+
+
+@route('POST', r'/api/v1/messages/(\d+)/cancel', EITHER)
+def h_cancel(ctx, mid):
+  return ctx.app.cancel_message(ctx.principal, int(mid), reason=ctx.body().get('reason'), admin=ctx.is_admin)
+
+
+@route('GET', r'/api/v1/messages/(\d+)/lifecycle', EITHER)
+def h_lifecycle(ctx, mid):
+  return ctx.app.message_lifecycle(ctx.principal, int(mid), admin=ctx.is_admin)
 
 
 @route('PUT', r'/api/v1/messages/(\d+)/reactions/([^/]+)', EITHER)
@@ -324,8 +368,7 @@ def h_history(ctx):
 def h_claim(ctx):
   q = ctx.query()
   wait = float(q.get('wait') or 25)
-  got = ctx.app.claim(ctx.principal, wait=wait)
-  return got or {'lease_id': None, 'message': None}
+  return ctx.app.claim(ctx.principal, wait=wait)
 
 
 @route('POST', r'/api/v1/deliveries/([A-Za-z0-9_\-]+)/(delivered|unconfirmed|failed)', AGENT)
@@ -517,7 +560,12 @@ class Handler(BaseHTTPRequestHandler):
       return self._json(404, {'error': 'not_found'})
     data = res.read_bytes()
     ext = path.suffix.lower()
-    cache = 'public, max-age=604800' if parts[0] == 'vendor' else 'no-cache'
+    if parts[0] == 'vendor':
+      cache = 'public, max-age=604800'
+    elif parts[0] == 'avatars':
+      cache = 'public, max-age=86400'
+    else:
+      cache = 'no-cache'
     self._headers(200, STATIC_TYPES.get(ext, 'application/octet-stream'), len(data),
                   cache=cache)
     self.wfile.write(data)
@@ -562,16 +610,35 @@ class Handler(BaseHTTPRequestHandler):
       return self._json(exc.status, exc.body())
     app = self.server.app
     q = ctx.query()
-    last = self.headers.get('Last-Event-ID') or q.get('last')
+    raw_last = self.headers.get('Last-Event-ID') or q.get('last')
+    latest = app.events.latest_id()
+    oldest = app.events.oldest_id()
+    reset_reason = None
     try:
-      last = int(last) if last not in (None, '') else app.events.latest_id()
+      if raw_last in (None, ''):
+        last = latest
+      else:
+        parsed = int(raw_last)
+        if parsed == -1:
+          last = (oldest - 1) if oldest is not None else 0
+        elif parsed > latest:
+          reset_reason = 'ahead'
+          last = latest
+        elif oldest is not None and parsed < oldest - 1:
+          reset_reason = 'expired'
+          last = latest
+        else:
+          last = parsed
     except ValueError:
-      last = app.events.latest_id()
+      last = latest
     self.close_connection = True
     self._headers(200, 'text/event-stream; charset=utf-8', None,
                   {'X-Accel-Buffering': 'no', 'Connection': 'close'}, cache='no-cache')
     try:
       self.wfile.write(b'retry: 3000\n\n')
+      if reset_reason:
+        rpayload = json.dumps({'reason': reset_reason, 'latest_id': latest})
+        self.wfile.write(f'id: {latest}\nevent: reset\ndata: {rpayload}\n\n'.encode('utf-8'))
       self.wfile.flush()
       while not self.server.stopping:
         batch = app.events.since(last)
@@ -583,7 +650,8 @@ class Handler(BaseHTTPRequestHandler):
           self.wfile.flush()
           continue
         if not app.events.wait(last, 15.0):
-          self.wfile.write(b': ping\n\n')
+          tick_data = json.dumps({'ts': round(app.now(), 3)})
+          self.wfile.write(f'event: tick\ndata: {tick_data}\n\n'.encode('utf-8'))
           self.wfile.flush()
           if not app.user_for_cookie(ctx.cookie()):
             return None
